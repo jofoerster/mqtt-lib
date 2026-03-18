@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [mqtt5 0.26.0] - 2026-03-18
+
+### Added
+
+- **ALPN negotiation for MQTT-next** - Client and broker negotiate `MQTT-next` vs `mqtt` ALPN per MQoQ §7.4
+  - Broker advertises both `MQTT-next` and `mqtt` ALPNs; clients requesting Advanced Multistreams get `MQTT-next`
+  - Client offers `["MQTT-next", "mqtt"]` when `enable_flow_headers` is true, `["mqtt"]` otherwise
+  - Negotiated ALPN read from `HandshakeData` after QUIC handshake; downgrade logged as warning
+  - Flow headers gated on successful `MQTT-next` negotiation — never sent to peers that didn't negotiate it
+
+### Changed
+
+- **BREAKING: `QuicTransport::into_split()` return type** - Returns `QuicSplitResult` struct instead of 6-element tuple
+- **`QuicStreamManager` now configured with flow header state** from `QuicSplitResult` (flow_headers, flow_expire_interval, flow_flags)
+
 ## [mqtt5 0.25.0] / [mqttv5-cli 0.23.0] / [mqtt5-wasm 1.3.0] - 2026-03-15
 
 ### Added

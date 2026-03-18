@@ -11,7 +11,10 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ClientConfig as RustlsClientConfig, RootCertStore};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tracing::{debug, instrument};
+use tracing::{debug, instrument, warn};
+
+pub const ALPN_MQTT: &[u8] = b"mqtt";
+pub const ALPN_MQTT_NEXT: &[u8] = b"MQTT-next";
 
 // [MQoQ§5] Multi-stream modes
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -233,7 +236,11 @@ impl QuicConfig {
                 .with_no_client_auth()
         };
 
-        crypto.alpn_protocols = vec![b"mqtt".to_vec()];
+        crypto.alpn_protocols = if self.enable_flow_headers {
+            vec![ALPN_MQTT_NEXT.to_vec(), ALPN_MQTT.to_vec()]
+        } else {
+            vec![ALPN_MQTT.to_vec()]
+        };
 
         let quic_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
             .map_err(|e| MqttError::ConnectionError(format!("Failed to build QUIC config: {e}")))?;
@@ -262,12 +269,26 @@ impl QuicConfig {
     }
 }
 
+pub struct QuicSplitResult {
+    pub send: SendStream,
+    pub recv: RecvStream,
+    pub connection: Connection,
+    pub endpoint: Endpoint,
+    pub strategy: StreamStrategy,
+    pub datagrams_enabled: bool,
+    pub flow_headers_enabled: bool,
+    pub negotiated_mqtt_next: bool,
+    pub flow_expire_interval: u64,
+    pub flow_flags: FlowFlags,
+}
+
 #[derive(Debug)]
 pub struct QuicTransport {
     config: QuicConfig,
     endpoint: Option<Endpoint>,
     connection: Option<Connection>,
     control_stream: Option<(SendStream, RecvStream)>,
+    negotiated_mqtt_next: bool,
 }
 
 impl QuicTransport {
@@ -278,6 +299,7 @@ impl QuicTransport {
             endpoint: None,
             connection: None,
             control_stream: None,
+            negotiated_mqtt_next: false,
         }
     }
 
@@ -290,22 +312,22 @@ impl QuicTransport {
     ///
     /// # Errors
     /// Returns an error if the transport is not connected.
-    pub fn into_split(
-        mut self,
-    ) -> Result<(
-        SendStream,
-        RecvStream,
-        Connection,
-        Endpoint,
-        StreamStrategy,
-        bool,
-    )> {
+    pub fn into_split(mut self) -> Result<QuicSplitResult> {
         let (send, recv) = self.control_stream.take().ok_or(MqttError::NotConnected)?;
-        let conn = self.connection.take().ok_or(MqttError::NotConnected)?;
+        let connection = self.connection.take().ok_or(MqttError::NotConnected)?;
         let endpoint = self.endpoint.take().ok_or(MqttError::NotConnected)?;
-        let strategy = self.config.stream_strategy;
-        let datagrams_enabled = self.config.enable_datagrams;
-        Ok((send, recv, conn, endpoint, strategy, datagrams_enabled))
+        Ok(QuicSplitResult {
+            send,
+            recv,
+            connection,
+            endpoint,
+            strategy: self.config.stream_strategy,
+            datagrams_enabled: self.config.enable_datagrams,
+            flow_headers_enabled: self.config.enable_flow_headers,
+            negotiated_mqtt_next: self.negotiated_mqtt_next,
+            flow_expire_interval: self.config.flow_expire_interval,
+            flow_flags: self.config.flow_flags,
+        })
     }
 
     #[must_use]
@@ -375,8 +397,19 @@ impl Transport for QuicTransport {
             .map_err(|_| MqttError::Timeout)?
             .map_err(|e| MqttError::ConnectionError(format!("QUIC handshake failed: {e}")))?;
 
+        let negotiated_mqtt_next = connection
+            .handshake_data()
+            .and_then(|hd| hd.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+            .and_then(|hd| hd.protocol.as_deref().map(|p| p == ALPN_MQTT_NEXT))
+            .unwrap_or(false);
+
+        if self.config.enable_flow_headers && !negotiated_mqtt_next {
+            warn!("flow headers requested but server negotiated mqtt (not MQTT-next), disabling flow headers");
+        }
+
         tracing::info!(
             remote_addr = %connection.remote_address(),
+            alpn = if negotiated_mqtt_next { "MQTT-next" } else { "mqtt" },
             "QUIC connection established"
         );
 
@@ -387,6 +420,7 @@ impl Transport for QuicTransport {
 
         tracing::debug!("QUIC control stream opened");
 
+        self.negotiated_mqtt_next = negotiated_mqtt_next;
         self.endpoint = Some(endpoint);
         self.connection = Some(connection);
         self.control_stream = Some((send, recv));
@@ -655,5 +689,38 @@ mod tests {
         assert_eq!(config.flow_expire_interval, 600);
         assert_eq!(config.flow_flags.persistent_qos, 1);
         assert_eq!(config.flow_flags.persistent_subscriptions, 1);
+    }
+
+    #[test]
+    fn test_alpn_without_flow_headers_builds() {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 14567);
+        let config = QuicConfig::new(addr, "localhost").with_verify_server_cert(false);
+        assert!(config.build_client_config().is_ok());
+    }
+
+    #[test]
+    fn test_alpn_with_flow_headers_builds() {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 14567);
+        let config = QuicConfig::new(addr, "localhost")
+            .with_verify_server_cert(false)
+            .with_flow_headers(true);
+        assert!(config.build_client_config().is_ok());
+    }
+
+    #[test]
+    fn test_negotiated_mqtt_next_defaults_false() {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 14567);
+        let config = QuicConfig::new(addr, "localhost")
+            .with_flow_headers(true)
+            .with_flow_expire_interval(600)
+            .with_datagrams(true);
+        let transport = QuicTransport::new(config);
+        assert!(!transport.negotiated_mqtt_next);
+    }
+
+    #[test]
+    fn test_alpn_constants() {
+        assert_eq!(ALPN_MQTT, b"mqtt");
+        assert_eq!(ALPN_MQTT_NEXT, b"MQTT-next");
     }
 }

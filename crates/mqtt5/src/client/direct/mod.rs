@@ -291,17 +291,23 @@ impl DirectClientInner {
                 )
             }
             TransportType::Quic(quic) => {
-                let (w, r, conn, endpoint, strategy, datagrams) = (*quic).into_split()?;
-                let conn_arc = Arc::new(conn);
+                let split = (*quic).into_split()?;
+                let conn_arc = Arc::new(split.connection);
                 self.quic_connection = Some(conn_arc.clone());
-                self.quic_endpoint = Some(endpoint);
-                self.stream_strategy = Some(strategy);
-                self.quic_datagrams_enabled = datagrams;
-                self.quic_stream_manager =
-                    Some(Arc::new(QuicStreamManager::new(conn_arc, strategy)));
+                self.quic_endpoint = Some(split.endpoint);
+                self.stream_strategy = Some(split.strategy);
+                self.quic_datagrams_enabled = split.datagrams_enabled;
+                let effective_flow_headers =
+                    split.flow_headers_enabled && split.negotiated_mqtt_next;
+                self.quic_stream_manager = Some(Arc::new(
+                    QuicStreamManager::new(conn_arc, split.strategy)
+                        .with_flow_headers(effective_flow_headers)
+                        .with_flow_expire_interval(split.flow_expire_interval)
+                        .with_flow_flags(split.flow_flags),
+                ));
                 (
-                    UnifiedReader::quic(r, protocol_version),
-                    UnifiedWriter::Quic(w),
+                    UnifiedReader::quic(split.recv, protocol_version),
+                    UnifiedWriter::Quic(split.send),
                 )
             }
         };

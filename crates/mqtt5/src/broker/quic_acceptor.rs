@@ -48,7 +48,7 @@ impl QuicAcceptorConfig {
             private_key,
             client_ca_certs: None,
             require_client_cert: false,
-            alpn_protocols: vec![b"mqtt".to_vec()],
+            alpn_protocols: vec![b"MQTT-next".to_vec(), b"mqtt".to_vec()],
         }
     }
 
@@ -742,11 +742,26 @@ mod tests {
         ]));
 
         let config = QuicAcceptorConfig::new(vec![cert.clone()], key.clone_key())
-            .with_require_client_cert(true)
-            .with_alpn_protocols(vec![b"mqtt".to_vec()]);
+            .with_require_client_cert(true);
 
         assert!(config.require_client_cert);
-        assert_eq!(config.alpn_protocols.len(), 1);
+        assert_eq!(config.alpn_protocols.len(), 2);
+        assert_eq!(config.alpn_protocols[0], b"MQTT-next");
+        assert_eq!(config.alpn_protocols[1], b"mqtt");
         assert_eq!(config.cert_chain.len(), 1);
+    }
+
+    #[test]
+    fn test_quic_acceptor_custom_alpn() {
+        let cert = CertificateDer::from(vec![0x30, 0x82, 0x01, 0x00]);
+        let key = PrivateKeyDer::from(rustls::pki_types::PrivatePkcs8KeyDer::from(vec![
+            0x30, 0x48, 0x02, 0x01,
+        ]));
+
+        let config = QuicAcceptorConfig::new(vec![cert.clone()], key.clone_key())
+            .with_alpn_protocols(vec![b"mqtt".to_vec()]);
+
+        assert_eq!(config.alpn_protocols.len(), 1);
+        assert_eq!(config.alpn_protocols[0], b"mqtt");
     }
 }
