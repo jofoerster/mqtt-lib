@@ -357,37 +357,49 @@ async fn try_read_flow_header(recv: &mut RecvStream) -> Result<FlowHeaderResult>
     let mut header_buf = Vec::with_capacity(32);
     header_buf.extend_from_slice(&chunk.bytes);
 
-    while header_buf.len() < 32 {
-        match recv.read_chunk(32 - header_buf.len(), true).await {
-            Ok(Some(chunk)) if !chunk.bytes.is_empty() => {
-                header_buf.extend_from_slice(&chunk.bytes);
+    let (flow_header, leftover) = loop {
+        let mut bytes = Bytes::copy_from_slice(&header_buf);
+        match FlowHeader::decode(&mut bytes) {
+            Ok(header) => {
+                let consumed = header_buf.len() - bytes.remaining();
+                let mut lo = BytesMut::with_capacity(bytes.remaining());
+                if consumed < header_buf.len() {
+                    lo.extend_from_slice(&header_buf[consumed..]);
+                }
+                break (header, lo);
             }
-            Ok(_) => break,
-            Err(e) => {
-                return Err(MqttError::ConnectionError(format!(
-                    "Failed to read flow header: {e}"
-                )));
+            Err(_) if header_buf.len() >= 32 => {
+                return Err(MqttError::ProtocolError("flow header too large".into()));
             }
+            Err(_) => match recv.read_chunk(32 - header_buf.len(), true).await {
+                Ok(Some(c)) if !c.bytes.is_empty() => {
+                    header_buf.extend_from_slice(&c.bytes);
+                }
+                Ok(_) => {
+                    return Err(MqttError::ProtocolError("incomplete flow header".into()));
+                }
+                Err(e) => {
+                    return Err(MqttError::ConnectionError(format!(
+                        "Failed to read flow header: {e}"
+                    )));
+                }
+            },
         }
-    }
+    };
 
-    let mut bytes = Bytes::from(header_buf);
-    let flow_header = FlowHeader::decode(&mut bytes)?;
+    Ok(build_flow_header_result(flow_header, leftover))
+}
 
-    let mut leftover = BytesMut::with_capacity(bytes.remaining());
-    if bytes.has_remaining() {
-        leftover.extend_from_slice(&bytes);
-    }
-
+fn build_flow_header_result(flow_header: FlowHeader, leftover: BytesMut) -> FlowHeaderResult {
     match flow_header {
         FlowHeader::Control(h) => {
             trace!(flow_id = ?h.flow_id, "Parsed control flow header");
-            Ok(FlowHeaderResult {
+            FlowHeaderResult {
                 flow_id: Some(h.flow_id),
                 flags: Some(h.flags),
                 expire: None,
                 leftover,
-            })
+            }
         }
         FlowHeader::ClientData(h) | FlowHeader::ServerData(h) => {
             let expire = if h.expire_interval > 0 {
@@ -396,21 +408,21 @@ async fn try_read_flow_header(recv: &mut RecvStream) -> Result<FlowHeaderResult>
                 None
             };
             trace!(flow_id = ?h.flow_id, expire = ?expire, "Parsed data flow header");
-            Ok(FlowHeaderResult {
+            FlowHeaderResult {
                 flow_id: Some(h.flow_id),
                 flags: Some(h.flags),
                 expire,
                 leftover,
-            })
+            }
         }
         FlowHeader::UserDefined(_) => {
             trace!("Ignoring user-defined flow header");
-            Ok(FlowHeaderResult {
+            FlowHeaderResult {
                 flow_id: None,
                 flags: None,
                 expire: None,
                 leftover,
-            })
+            }
         }
     }
 }
@@ -559,7 +571,8 @@ async fn run_quic_handler_inner(
     skip_bridge_forwarding: bool,
     label: &'static str,
 ) {
-    let (packet_tx, packet_rx) = mpsc::channel::<Packet>(100);
+    let (packet_tx, packet_rx) = mpsc::channel::<(Packet, Option<u64>)>(100);
+    let (flow_closed_tx, flow_closed_rx) = mpsc::channel::<u64>(32);
     let flow_registry = Arc::new(Mutex::new(FlowRegistry::new(256)));
 
     let (send, recv) = match connection.accept_bi().await {
@@ -594,7 +607,9 @@ async fn run_quic_handler_inner(
     )
     .with_quic_connection(connection.clone())
     .with_server_delivery_strategy(delivery_strategy)
-    .with_skip_bridge_forwarding(skip_bridge_forwarding);
+    .with_skip_bridge_forwarding(skip_bridge_forwarding)
+    .with_flow_closed_rx(flow_closed_rx)
+    .with_flow_registry(flow_registry.clone());
 
     let handler_label = label;
     tokio::spawn(async move {
@@ -609,12 +624,19 @@ async fn run_quic_handler_inner(
 
     spawn_datagram_reader(connection.clone(), packet_tx.clone(), peer_addr, label);
     spawn_bi_accept_loop(connection.clone(), flow_registry.clone(), peer_addr, label);
-    spawn_uni_accept_loop(connection, packet_tx, peer_addr, flow_registry, label);
+    spawn_uni_accept_loop(
+        connection,
+        packet_tx,
+        peer_addr,
+        flow_registry,
+        flow_closed_tx,
+        label,
+    );
 }
 
 fn spawn_datagram_reader(
     connection: Arc<Connection>,
-    packet_tx: mpsc::Sender<Packet>,
+    packet_tx: mpsc::Sender<(Packet, Option<u64>)>,
     peer_addr: SocketAddr,
     label: &'static str,
 ) {
@@ -630,7 +652,7 @@ fn spawn_datagram_reader(
                     );
                     match decode_datagram_packet(&datagram) {
                         Some(Ok(packet)) => {
-                            if packet_tx.send(packet).await.is_err() {
+                            if packet_tx.send((packet, None)).await.is_err() {
                                 debug!("Datagram packet channel closed for {}", peer_addr);
                                 break;
                             }
@@ -681,9 +703,10 @@ fn spawn_bi_accept_loop(
 
 fn spawn_uni_accept_loop(
     connection: Arc<Connection>,
-    packet_tx: mpsc::Sender<Packet>,
+    packet_tx: mpsc::Sender<(Packet, Option<u64>)>,
     peer_addr: SocketAddr,
     flow_registry: Arc<Mutex<FlowRegistry>>,
+    flow_closed_tx: mpsc::Sender<u64>,
     label: &'static str,
 ) {
     tokio::spawn(async move {
@@ -699,6 +722,7 @@ fn spawn_uni_accept_loop(
                         packet_tx.clone(),
                         peer_addr,
                         flow_registry.clone(),
+                        flow_closed_tx.clone(),
                     );
                 }
                 Err(e) => {
@@ -830,9 +854,10 @@ fn spawn_discard_handler(
 // [MQoQ§5] Data stream processing
 fn spawn_data_stream_reader(
     mut recv: RecvStream,
-    packet_tx: mpsc::Sender<Packet>,
+    packet_tx: mpsc::Sender<(Packet, Option<u64>)>,
     peer_addr: SocketAddr,
     flow_registry: Arc<Mutex<FlowRegistry>>,
+    flow_closed_tx: mpsc::Sender<u64>,
 ) {
     tokio::spawn(async move {
         let (flow_id, mut buffer) = match try_read_flow_header(&mut recv).await {
@@ -865,8 +890,9 @@ fn spawn_data_stream_reader(
                         let mut registry = flow_registry.lock().await;
                         registry.touch(id);
                     }
+                    let raw_flow_id = flow_id.map(|f| f.raw());
                     debug!(flow_id = ?flow_id, packet_type = %packet.packet_type_name(), "Read packet from QUIC data stream");
-                    if packet_tx.send(packet).await.is_err() {
+                    if packet_tx.send((packet, raw_flow_id)).await.is_err() {
                         debug!("Packet channel closed, stopping data stream reader");
                         break;
                     }
@@ -893,6 +919,7 @@ fn spawn_data_stream_reader(
                 debug!(flow_id = ?id, "Preserving flow state (err_tolerance >= 2) for recovery");
             } else if registry.remove(id).is_some() {
                 debug!(flow_id = ?id, "Removed flow from registry");
+                let _ = flow_closed_tx.send(id.raw()).await;
             }
         }
     });
