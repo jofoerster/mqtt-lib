@@ -381,11 +381,11 @@ fn test_message_ordering_with_multiple_clients() {
         let mut client2_messages = Vec::new();
 
         while let Ok(msg) = rx1.try_recv() {
-            client1_messages.push(String::from_utf8(msg.payload.to_vec()).unwrap());
+            client1_messages.push(String::from_utf8(msg.publish.payload.to_vec()).unwrap());
         }
 
         while let Ok(msg) = rx2.try_recv() {
-            client2_messages.push(String::from_utf8(msg.payload.to_vec()).unwrap());
+            client2_messages.push(String::from_utf8(msg.publish.payload.to_vec()).unwrap());
         }
 
         assert_eq!(client1_messages.len(), 5);
