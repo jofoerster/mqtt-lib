@@ -1,0 +1,9 @@
+[package]
+name = "mqtt5-wasi-bench"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+
+[dependencies]
+mqtt5 = { version = "0.31", path = "../../mqtt5" }
+tokio = { version = "1.47", features = ["full"] }

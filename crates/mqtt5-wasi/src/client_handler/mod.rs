@@ -74,7 +74,7 @@ impl WasiClientHandler {
         stats: Arc<BrokerStats>,
         resource_monitor: Arc<ResourceMonitor>,
     ) -> Self {
-        let (publish_tx, publish_rx) = flume::bounded(100);
+        let (publish_tx, publish_rx) = flume::bounded(10_000);
         let handler_id = HANDLER_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
         Self {

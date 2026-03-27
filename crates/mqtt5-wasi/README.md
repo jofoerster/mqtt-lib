@@ -148,51 +148,71 @@ Benchmark results on a single machine (wasmtime v43, `wasm32-wasip2`, sequential
 
 ### Methodology
 
-The benchmark measures three scenarios:
+Two benchmark tools are provided:
 
-1. **Round-trip latency**: a single message published and received by one subscriber. Measures the wall-clock time from `mosquitto_pub` invocation to `mosquitto_sub` exit.
-2. **Sustained throughput**: *N* sequential publishes with one subscriber. Each `mosquitto_pub` invocation is a separate process (connect, publish, disconnect), so the numbers include per-message TCP connection overhead.
-3. **Fan-out**: one publisher sending *N/10* messages with 5 concurrent subscribers.
+1. **`scripts/bench.sh`** -- uses `mosquitto_pub`/`mosquitto_sub` (one process per message). Useful for basic smoke tests but dominated by per-message TCP connection overhead (~3--5 ms).
+2. **`bench/` crate** (`mqtt5-wasi-bench`) -- uses the `mqtt5` native client with persistent TCP connections. This measures the broker's true routing throughput by eliminating per-message connection overhead. Each run uses a 100-message warmup phase, and statistics are computed across multiple runs.
 
-Note: these numbers reflect `mosquitto_pub` spawning a new process per message, which dominates the cost. The broker's internal routing is substantially faster than what the external client tooling can saturate.
+### Results (persistent connections)
 
-### Results
+**50,000 messages, 256-byte payload, 3 subscribers (fresh broker per run):**
 
-**1000 messages, 64-byte payload, 5 runs:**
+| Metric | Value |
+|--------|-------|
+| Round-trip latency | 4.4 -- 5.5 ms (median 4.5 ms, stddev 0.5 ms) |
+| Publish rate | 14,709 msg/s |
+| E2E delivery rate | 34,655 msg/s (3 subscribers) |
+| Throughput | 8,664 KB/s (~8.5 MB/s) |
+| Delivery | 150,000 / 150,000 (100%) |
 
-| Metric | Min | Median | Mean | p95 | Stddev |
-|--------|-----|--------|------|-----|--------|
-| Round-trip latency | 8 ms | 9 ms | 8 ms | 10 ms | 1 ms |
-| Publish rate | 240 msg/s | 282 msg/s | 307 msg/s | 379 msg/s | 51 msg/s |
-| End-to-end rate | 240 msg/s | 282 msg/s | 306 msg/s | 379 msg/s | 50 msg/s |
-| Throughput | 15 KB/s | 17 KB/s | 18 KB/s | 23 KB/s | 3 KB/s |
-| Fan-out (5 subs, 100 msgs) | 453 ms | 468 ms | 465 ms | 480 ms | 10 ms |
-| Fan-out delivery | 500/500 messages across all runs (100% delivery) |
+The E2E rate exceeds the pub rate because 3 subscribers each receive every message: the broker routes 150,000 deliveries from 50,000 publishes.
 
 ### Interpretation
 
-The primary bottleneck is **not the broker**. Each `mosquitto_pub` call creates a new TCP connection, performs an MQTT CONNECT/CONNACK handshake, publishes one message, sends DISCONNECT, and closes the socket. This per-message overhead (~3--5 ms) accounts for the majority of the measured latency and limits throughput to a few hundred messages per second.
+- **Latency is stable**: 4.4 -- 5.5 ms round-trip with 0.5 ms stddev, reflecting the executor's ~1 ms poll cycle plus WASI I/O overhead.
+- **Publish rate (14.7k msg/s)**: limited by the single-threaded executor alternating between the accept loop, packet readers, and publish forwarders. The publisher's TCP connection is handled by one task that must yield to let other tasks run.
+- **E2E delivery rate (34.7k msg/s)**: exceeds the publish rate because 3 subscriber forwarder tasks run concurrently, each draining from a 10,000-slot channel. The broker's `MessageRouter` dispatches to all matching subscribers in a single `route_message` call.
+- **Throughput (8.5 MB/s)**: 34,655 deliveries/s * 256 bytes. This is the effective data throughput across all subscribers.
+- **Multi-run degradation**: spawned sub-tasks (keep-alive checkers, disconnect watchers, publish forwarders) are not cleaned up when a client disconnects. Under repeated benchmark runs without restarting the broker, orphaned tasks accumulate and compete for executor cycles, degrading throughput. For accurate measurements, restart the broker between runs. This is tracked as a known limitation.
 
-Evidence supporting this interpretation:
+### Comparing against native Mosquitto
 
-- **Fan-out is efficient**: 5 subscribers receive 100% of messages (500/500) with low variance (stddev 10 ms), meaning the broker's internal `MessageRouter` dispatch adds negligible overhead per additional subscriber.
-- **Pub rate tracks E2E rate**: publish and end-to-end rates are nearly identical (282 vs 282 msg/s median), confirming that the broker routes messages as fast as they arrive -- there is no internal queuing delay.
-- **Variance is low**: latency stddev is 1 ms; throughput stddev is ~17% of mean. The variance is consistent with process-spawn jitter rather than broker-internal contention.
-
-To measure the broker's true internal throughput, a persistent-connection client (e.g., a custom Rust MQTT client using a single TCP session) would eliminate per-message connection overhead. The cooperative executor's round-robin polling adds ~1 ms idle sleep between cycles, setting a theoretical floor of ~1000 polls/second, but in practice the executor wakes immediately when I/O is ready via `Pollable::ready()`.
-
-### Running the benchmark
+To contextualize the WASI broker's performance, run the same benchmark against a native Mosquitto broker:
 
 ```bash
-# Start the broker
+# Install and start mosquitto (uses port 1883 by default)
+sudo apt install mosquitto
+sudo systemctl start mosquitto
+
+# Run the benchmark against mosquitto
+cargo run -p mqtt5-wasi-bench --release -- 50000 256 10 3
+
+# Then restart the WASI broker and run the same benchmark
+sudo systemctl stop mosquitto
+wasmtime run -S inherit-network target/wasm32-wasip2/release/mqtt5-broker.wasm &
+cargo run -p mqtt5-wasi-bench --release -- 50000 256 10 3
+```
+
+Both use the same benchmark binary, same parameters, same persistent connections -- only the broker differs.
+
+### Running the benchmarks
+
+```bash
+# Build everything
+cargo build -p mqtt5-wasi --target wasm32-wasip2 --release
+cargo build -p mqtt5-wasi-bench --release
+
+# Start the WASI broker
 wasmtime run -S inherit-network \
   target/wasm32-wasip2/release/mqtt5-broker.wasm &
 
-# Default: 1000 messages, 64B payload, 5 runs
-./crates/mqtt5-wasi/scripts/bench.sh
+# Persistent-connection benchmark (recommended)
+# Args: [messages] [payload_size] [runs] [subscribers] [broker_url]
+cargo run -p mqtt5-wasi-bench --release                           # 10k msgs, 64B, 5 runs, 1 sub
+cargo run -p mqtt5-wasi-bench --release -- 50000 256 10 3         # 50k msgs, 256B, 10 runs, 3 subs
 
-# Custom: 5000 messages, 256B payload, 10 runs
-./crates/mqtt5-wasi/scripts/bench.sh 5000 256 127.0.0.1:1883 10
+# Shell-based benchmark (mosquitto_pub/sub, one process per message)
+./crates/mqtt5-wasi/scripts/bench.sh 1000 64 127.0.0.1:1883 5
 ```
 
 ## Binary Size

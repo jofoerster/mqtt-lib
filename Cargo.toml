@@ -4,6 +4,7 @@ members = [
     "crates/mqtt5",
     "crates/mqtt5-wasm",
     "crates/mqtt5-wasi",
+    "crates/mqtt5-wasi/bench",
     "crates/mqttv5-cli",
     "crates/mqtt5-conformance",
 ]
