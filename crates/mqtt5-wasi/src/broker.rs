@@ -10,7 +10,13 @@ use mqtt5::broker::router::MessageRouter;
 use mqtt5::broker::storage::{DynamicStorage, MemoryBackend};
 use mqtt5::broker::sys_topics::BrokerStats;
 use mqtt5::time::Duration;
+use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
+use tracing::{error, info};
+use wasi::sockets::instance_network::instance_network;
+use wasi::sockets::network::{IpAddressFamily, IpSocketAddress, Ipv4SocketAddress};
+use wasi::sockets::tcp::TcpSocket;
+use wasi::sockets::tcp_create_socket::create_tcp_socket;
 
 /// Configuration for the WASI MQTT broker.
 #[allow(clippy::struct_excessive_bools)]
@@ -99,9 +105,8 @@ impl WasiBrokerConfig {
 
 /// Standalone WASI MQTT v5.0 broker.
 ///
-/// On WASI, uses the native `wasi:sockets/tcp` API with non-blocking
-/// `InputStream::read()` for cooperative concurrency. On native targets,
-/// uses `std::net` with non-blocking mode for development/testing.
+/// Uses the native `wasi:sockets/tcp` API with non-blocking
+/// `InputStream::read()` for cooperative concurrency.
 pub struct WasiBroker {
     config: Arc<RwLock<BrokerConfig>>,
     router: Arc<MessageRouter>,
@@ -113,7 +118,12 @@ pub struct WasiBroker {
 
 impl WasiBroker {
     /// Create a new broker with the given configuration.
-    pub fn new(wasi_config: WasiBrokerConfig) -> Self {
+    ///
+    /// # Panics
+    /// Panics if the internal config lock is poisoned.
+    #[must_use]
+    #[allow(clippy::arc_with_non_send_sync)]
+    pub fn new(wasi_config: &WasiBrokerConfig) -> Self {
         let allow_anonymous = wasi_config.allow_anonymous;
         let config = Arc::new(RwLock::new(wasi_config.to_broker_config()));
 
@@ -166,16 +176,17 @@ impl WasiBroker {
     }
 
     /// Create a new broker with default configuration (anonymous access enabled).
+    #[must_use]
     pub fn default_anonymous() -> Self {
-        Self::new(WasiBrokerConfig::default())
+        Self::new(&WasiBrokerConfig::default())
     }
 
     /// Run the broker, accepting TCP connections on the given address.
     ///
-    /// This consumes the broker and blocks forever (or until the process
-    /// is killed).
+    /// This consumes the broker and blocks forever (or until the process is killed).
     pub fn run(self, bind_addr: &str) {
-        eprintln!("WASI MQTT broker starting on {bind_addr}");
+        let listener = bind_and_listen(bind_addr);
+        info!(bind_addr, "WASI MQTT broker listening");
 
         let config = self.config;
         let router = self.router;
@@ -184,130 +195,9 @@ impl WasiBroker {
         let stats = self.stats;
         let resource_monitor = self.resource_monitor;
 
-        #[cfg(target_os = "wasi")]
-        {
-            self::wasi_run::run_wasi(
-                bind_addr, config, router, auth_provider, storage, stats, resource_monitor,
-            );
-        }
-
-        #[cfg(not(target_os = "wasi"))]
-        {
-            self::native_run::run_native(
-                bind_addr, config, router, auth_provider, storage, stats, resource_monitor,
-            );
-        }
-    }
-
-    /// Get a reference to the message router.
-    pub fn router(&self) -> &Arc<MessageRouter> {
-        &self.router
-    }
-
-    /// Get a reference to the broker stats.
-    pub fn stats(&self) -> &Arc<BrokerStats> {
-        &self.stats
-    }
-}
-
-// ---------------------------------------------------------------------------
-// WASI: use wasi:sockets/tcp with non-blocking InputStream::read()
-// ---------------------------------------------------------------------------
-#[cfg(target_os = "wasi")]
-mod wasi_run {
-    use super::*;
-    use std::net::SocketAddr;
-    use wasi::sockets::instance_network::instance_network;
-    use wasi::sockets::network::{IpAddressFamily, IpSocketAddress, Ipv4SocketAddress};
-    use wasi::sockets::tcp::TcpSocket;
-    use wasi::sockets::tcp_create_socket::create_tcp_socket;
-
-    fn parse_bind_addr(addr: &str) -> IpSocketAddress {
-        let sock: SocketAddr = addr.parse().expect("Invalid bind address");
-        match sock {
-            SocketAddr::V4(v4) => {
-                let octets = v4.ip().octets();
-                IpSocketAddress::Ipv4(Ipv4SocketAddress {
-                    port: v4.port(),
-                    address: (octets[0], octets[1], octets[2], octets[3]),
-                })
-            }
-            SocketAddr::V6(_) => {
-                panic!("IPv6 not yet supported in WASI broker");
-            }
-        }
-    }
-
-    fn socket_addr_from_wasi(addr: &IpSocketAddress) -> SocketAddr {
-        match addr {
-            IpSocketAddress::Ipv4(v4) => {
-                let ip = std::net::Ipv4Addr::new(
-                    v4.address.0,
-                    v4.address.1,
-                    v4.address.2,
-                    v4.address.3,
-                );
-                SocketAddr::new(std::net::IpAddr::V4(ip), v4.port)
-            }
-            IpSocketAddress::Ipv6(v6) => {
-                let ip = std::net::Ipv6Addr::new(
-                    v6.address.0,
-                    v6.address.1,
-                    v6.address.2,
-                    v6.address.3,
-                    v6.address.4,
-                    v6.address.5,
-                    v6.address.6,
-                    v6.address.7,
-                );
-                SocketAddr::new(std::net::IpAddr::V6(ip), v6.port)
-            }
-        }
-    }
-
-    fn bind_and_listen(addr: &str) -> TcpSocket {
-        let network = instance_network();
-        let bind_addr = parse_bind_addr(addr);
-
-        let family = match &bind_addr {
-            IpSocketAddress::Ipv4(_) => IpAddressFamily::Ipv4,
-            IpSocketAddress::Ipv6(_) => IpAddressFamily::Ipv6,
-        };
-
-        let socket = create_tcp_socket(family).expect("Failed to create TCP socket");
-
-        socket
-            .start_bind(&network, bind_addr)
-            .expect("Failed to start bind");
-        // Block until bind completes
-        wasi::io::poll::poll(&[&socket.subscribe()]);
-        socket.finish_bind().expect("Failed to finish bind");
-
-        socket.start_listen().expect("Failed to start listen");
-        wasi::io::poll::poll(&[&socket.subscribe()]);
-        socket.finish_listen().expect("Failed to finish listen");
-
-        socket
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn run_wasi(
-        bind_addr: &str,
-        config: Arc<RwLock<BrokerConfig>>,
-        router: Arc<MessageRouter>,
-        auth_provider: Arc<dyn AuthProvider>,
-        storage: Arc<DynamicStorage>,
-        stats: Arc<BrokerStats>,
-        resource_monitor: Arc<ResourceMonitor>,
-    ) {
-        let listener = bind_and_listen(bind_addr);
-        eprintln!("WASI MQTT broker listening on {bind_addr}");
-
         crate::executor::block_on(async move {
             loop {
-                // Check listener readiness without blocking
-                let pollable = listener.subscribe();
-                if !pollable.ready() {
+                if !listener.subscribe().ready() {
                     crate::executor::yield_now().await;
                     continue;
                 }
@@ -316,18 +206,17 @@ mod wasi_run {
                     Ok((client_socket, input, output)) => {
                         let addr = client_socket
                             .remote_address()
-                            .map(|a| socket_addr_from_wasi(&a))
-                            .unwrap_or_else(|_| {
+                            .map_or(
                                 SocketAddr::new(
                                     std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
                                     0,
-                                )
-                            });
+                                ),
+                                |a| socket_addr_from_wasi(&a),
+                            );
 
-                        eprintln!("New connection from {addr}");
+                        info!(%addr, "New connection");
 
                         let stream = WasiStream::new(client_socket, input, output);
-
                         let handler = WasiClientHandler::new(
                             addr,
                             Arc::clone(&config),
@@ -340,81 +229,98 @@ mod wasi_run {
 
                         crate::executor::spawn(async move {
                             if let Err(e) = handler.run(stream).await {
-                                eprintln!("Client handler error ({addr}): {e}");
+                                error!(%addr, error = %e, "Client handler error");
                             }
                         });
                     }
                     Err(wasi::sockets::network::ErrorCode::WouldBlock) => {
-                        // Spurious ready -- yield and retry
                         crate::executor::yield_now().await;
                     }
                     Err(e) => {
-                        eprintln!("Accept failed: {e:?}");
+                        error!(error = ?e, "Accept failed");
                         crate::executor::yield_now().await;
                     }
                 }
             }
         });
+    }
+
+    /// Get a reference to the message router.
+    #[must_use]
+    pub fn router(&self) -> &Arc<MessageRouter> {
+        &self.router
+    }
+
+    /// Get a reference to the broker stats.
+    #[must_use]
+    pub fn stats(&self) -> &Arc<BrokerStats> {
+        &self.stats
     }
 }
 
-// ---------------------------------------------------------------------------
-// Native: std::net with non-blocking mode (for development/testing)
-// ---------------------------------------------------------------------------
-#[cfg(not(target_os = "wasi"))]
-mod native_run {
-    use super::*;
-    use std::net::TcpListener;
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn run_native(
-        bind_addr: &str,
-        config: Arc<RwLock<BrokerConfig>>,
-        router: Arc<MessageRouter>,
-        auth_provider: Arc<dyn AuthProvider>,
-        storage: Arc<DynamicStorage>,
-        stats: Arc<BrokerStats>,
-        resource_monitor: Arc<ResourceMonitor>,
-    ) {
-        let listener = TcpListener::bind(bind_addr)
-            .unwrap_or_else(|e| panic!("Failed to bind to {bind_addr}: {e}"));
-        listener
-            .set_nonblocking(true)
-            .expect("Failed to set listener non-blocking");
-
-        eprintln!("MQTT broker listening on {bind_addr}");
-
-        crate::executor::block_on(async move {
-            loop {
-                match listener.accept() {
-                    Ok((tcp_stream, addr)) => {
-                        eprintln!("New connection from {addr}");
-                        let stream = WasiStream::new_from_std(tcp_stream);
-
-                        let handler = WasiClientHandler::new(
-                            addr,
-                            Arc::clone(&config),
-                            Arc::clone(&router),
-                            Arc::clone(&auth_provider),
-                            Arc::clone(&storage),
-                            Arc::clone(&stats),
-                            Arc::clone(&resource_monitor),
-                        );
-
-                        crate::executor::spawn(async move {
-                            if let Err(e) = handler.run(stream).await {
-                                eprintln!("Client handler error ({addr}): {e}");
-                            }
-                        });
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        crate::executor::yield_now().await;
-                    }
-                    Err(e) => {
-                        eprintln!("Accept failed: {e}");
-                    }
-                }
-            }
-        });
+fn parse_bind_addr(addr: &str) -> IpSocketAddress {
+    let sock: SocketAddr = addr.parse().expect("Invalid bind address");
+    match sock {
+        SocketAddr::V4(v4) => {
+            let octets = v4.ip().octets();
+            IpSocketAddress::Ipv4(Ipv4SocketAddress {
+                port: v4.port(),
+                address: (octets[0], octets[1], octets[2], octets[3]),
+            })
+        }
+        SocketAddr::V6(_) => {
+            panic!("IPv6 not yet supported in WASI broker");
+        }
     }
+}
+
+fn socket_addr_from_wasi(addr: &IpSocketAddress) -> SocketAddr {
+    match addr {
+        IpSocketAddress::Ipv4(v4) => {
+            let ip = std::net::Ipv4Addr::new(
+                v4.address.0,
+                v4.address.1,
+                v4.address.2,
+                v4.address.3,
+            );
+            SocketAddr::new(std::net::IpAddr::V4(ip), v4.port)
+        }
+        IpSocketAddress::Ipv6(v6) => {
+            let ip = std::net::Ipv6Addr::new(
+                v6.address.0,
+                v6.address.1,
+                v6.address.2,
+                v6.address.3,
+                v6.address.4,
+                v6.address.5,
+                v6.address.6,
+                v6.address.7,
+            );
+            SocketAddr::new(std::net::IpAddr::V6(ip), v6.port)
+        }
+    }
+}
+
+fn bind_and_listen(addr: &str) -> TcpSocket {
+    let network = instance_network();
+    let bind_addr = parse_bind_addr(addr);
+
+    let family = match &bind_addr {
+        IpSocketAddress::Ipv4(_) => IpAddressFamily::Ipv4,
+        IpSocketAddress::Ipv6(_) => IpAddressFamily::Ipv6,
+    };
+
+    let socket = create_tcp_socket(family).expect("Failed to create TCP socket");
+
+    socket
+        .start_bind(&network, bind_addr)
+        .expect("Failed to start bind");
+    wasi::io::poll::poll(&[&socket.subscribe()]);
+    socket.finish_bind().expect("Failed to finish bind");
+
+    socket.start_listen().expect("Failed to start listen");
+    wasi::io::poll::poll(&[&socket.subscribe()]);
+    socket.finish_listen().expect("Failed to finish listen");
+
+    socket
 }

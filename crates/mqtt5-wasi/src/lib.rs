@@ -1,3 +1,6 @@
+#![warn(clippy::pedantic)]
+#![cfg(target_os = "wasi")]
+
 mod broker;
 mod client_handler;
 mod decoder;

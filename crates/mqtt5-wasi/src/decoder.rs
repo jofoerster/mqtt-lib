@@ -4,10 +4,10 @@ use mqtt5_protocol::constants::limits::MAX_PACKET_SIZE;
 use mqtt5_protocol::error::{MqttError, Result};
 use mqtt5_protocol::packet::{FixedHeader, Packet};
 
-/// Read and decode an MQTT packet from the WASI TCP stream.
+/// Read and decode a single MQTT packet from the stream.
 ///
-/// `protocol_version` is needed because MQTT 3.1.1 (v4) and MQTT 5.0 (v5)
-/// have different packet formats (v5 adds properties fields).
+/// `protocol_version` is required because MQTT 3.1.1 (v4) and MQTT 5.0 (v5)
+/// have different wire formats (v5 adds property fields to most packet types).
 pub async fn read_packet(stream: &WasiStream, protocol_version: u8) -> Result<Packet> {
     let mut header_buf = vec![0u8; 5];
     let n = stream.read(&mut header_buf).await?;
@@ -20,11 +20,10 @@ pub async fn read_packet(stream: &WasiStream, protocol_version: u8) -> Result<Pa
     let fixed_header = FixedHeader::decode(&mut cursor)?;
 
     let remaining_length = fixed_header.remaining_length as usize;
-    let max_size = MAX_PACKET_SIZE as usize;
-    if remaining_length > max_size {
+    if remaining_length > MAX_PACKET_SIZE as usize {
         return Err(MqttError::PacketTooLarge {
             size: remaining_length,
-            max: max_size,
+            max: MAX_PACKET_SIZE as usize,
         });
     }
 
