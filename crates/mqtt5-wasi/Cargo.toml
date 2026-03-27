@@ -1,0 +1,29 @@
+[package]
+name = "mqtt5-wasi"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "MQTT v5.0 standalone WASI broker for wasmtime environments"
+keywords = ["mqtt", "wasm", "wasi", "iot", "broker"]
+categories = ["network-programming"]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+mqtt5-protocol = "0.12.0"
+mqtt5 = { version = "0.31", default-features = false, features = ["tokio"] }
+
+bytes = "1.10"
+flume = "0.12.0"
+tracing = "0.1"
+getrandom = "0.3"
+
+# tokio sync is needed because MessageRouter::register_client takes tokio::sync::oneshot::Sender
+tokio = { version = "1.47", features = ["sync"] }
+
+# Raw WASI bindings for non-blocking sockets and polling
+wasi = "0.14"
