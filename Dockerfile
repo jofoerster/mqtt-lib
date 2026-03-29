@@ -9,6 +9,6 @@ RUN cargo build --release -p mqttv5-cli \
 FROM scratch
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=builder /build/target/release/mqttv5 /mqttv5
-EXPOSE 1883 8883 8080 8443
+EXPOSE 1883 8883 8080 8443 14567/udp
 ENTRYPOINT ["/mqttv5"]
 CMD ["broker", "--help"]
