@@ -19,12 +19,23 @@ use crate::transport::QuicTransport;
 use crate::transport::{TcpTransport, TlsTransport, TransportType};
 
 use super::connection::{ConnectionEvent, DisconnectReason};
+use super::direct::{AutomaticReconnectLifecycle, StoredSubscription};
 use super::state::ClientTransportType;
 use super::MqttClient;
 
-use super::direct::AutomaticReconnectLifecycle;
-
 impl MqttClient {
+    async fn on_successful_connect(
+        &self,
+        stored_subs: Vec<StoredSubscription>,
+        session_present: bool,
+    ) {
+        self.trigger_connection_event(ConnectionEvent::Connected { session_present })
+            .await;
+        self.recover_quic_flows().await;
+        self.restore_subscriptions_after_connect(stored_subs, session_present)
+            .await;
+    }
+
     #[cfg(any(not(feature = "transport-websocket"), not(feature = "transport-quic")))]
     fn unsupported_transport_feature(transport: &str, feature: &str) -> MqttError {
         MqttError::Configuration(format!(
@@ -410,10 +421,7 @@ impl MqttClient {
                     let session_present = result.session_present;
                     drop(inner);
 
-                    self.trigger_connection_event(ConnectionEvent::Connected { session_present })
-                        .await;
-                    self.recover_quic_flows().await;
-                    self.restore_subscriptions_after_connect(stored_subs, session_present)
+                    self.on_successful_connect(stored_subs, session_present)
                         .await;
 
                     return Ok(result);
@@ -519,44 +527,8 @@ impl MqttClient {
                 let session_present = result.session_present;
                 drop(inner);
 
-                self.trigger_connection_event(ConnectionEvent::Connected { session_present })
+                self.on_successful_connect(stored_subs, session_present)
                     .await;
-
-                self.recover_quic_flows().await;
-
-                if !stored_subs.is_empty() {
-                    if session_present {
-                        tracing::info!(
-                            "Session resumed, restoring {} callbacks",
-                            stored_subs.len()
-                        );
-                        let inner = self.inner.read().await;
-                        for (topic, _, callback_id) in stored_subs {
-                            if !inner.callback_manager.restore_callback(callback_id) {
-                                tracing::warn!(
-                                    "Failed to restore callback for {topic}: not found in registry"
-                                );
-                            }
-                        }
-                    } else {
-                        tracing::info!(
-                            "Session not resumed, restoring {} subscriptions",
-                            stored_subs.len()
-                        );
-                        for (topic, options, callback_id) in stored_subs {
-                            if let Err(e) = self
-                                .resubscribe_internal(&topic, options, callback_id)
-                                .await
-                            {
-                                tracing::warn!(
-                                    "Failed to restore subscription to {}: {}",
-                                    topic,
-                                    e
-                                );
-                            }
-                        }
-                    }
-                }
 
                 Ok(result)
             }

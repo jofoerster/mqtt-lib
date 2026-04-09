@@ -4,9 +4,11 @@ use mqtt5::broker::config::{BrokerConfig, QuicConfig, ServerDeliveryStrategy};
 use mqtt5::broker::MqttBroker;
 use mqtt5::time::Duration;
 use mqtt5::transport::StreamStrategy;
-use mqtt5::MqttClient;
+use mqtt5::{ConnectOptions, ConnectionEvent, MqttClient};
 use std::net::SocketAddr;
+use std::path::Path;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use ulid::Ulid;
@@ -15,23 +17,50 @@ fn test_client_id(prefix: &str) -> String {
     format!("{}-{}", prefix, Ulid::new())
 }
 
+fn ensure_test_certs(manifest_dir: &Path) {
+    let cert_dir = manifest_dir.join("../../test_certs");
+    let server_cert = cert_dir.join("server.pem");
+    let server_key = cert_dir.join("server.key");
+
+    if server_cert.exists() && server_key.exists() {
+        return;
+    }
+
+    let status = Command::new(manifest_dir.join("../../scripts/generate_test_certs.sh"))
+        .current_dir(manifest_dir.join("../.."))
+        .status()
+        .expect("failed to generate test certificates");
+    assert!(status.success(), "test certificate generation failed");
+}
+
 async fn start_quic_broker(quic_port: u16) -> (MqttBroker, SocketAddr) {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let quic_addr: SocketAddr = format!("127.0.0.1:{quic_port}").parse().unwrap();
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    ensure_test_certs(manifest_dir);
+    let cert_dir = manifest_dir.join("../../test_certs");
 
     let config = BrokerConfig::default()
         .with_bind_address(([127, 0, 0, 1], 0))
         .with_quic(
-            QuicConfig::new(
-                PathBuf::from("../../test_certs/server.pem"),
-                PathBuf::from("../../test_certs/server.key"),
-            )
-            .with_bind_address(quic_addr),
+            QuicConfig::new(cert_dir.join("server.pem"), cert_dir.join("server.key"))
+                .with_bind_address(quic_addr),
         );
 
     let broker = MqttBroker::with_config(config).await.unwrap();
     (broker, quic_addr)
+}
+
+async fn wait_for_connected(client: &MqttClient, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while tokio::time::Instant::now() < deadline {
+        if client.is_connected().await {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    client.is_connected().await
 }
 
 #[tokio::test]
@@ -81,6 +110,238 @@ async fn test_broker_default_quic_port() {
         .bind_addresses
         .iter()
         .all(|addr| addr.port() == 14567));
+}
+
+#[tokio::test]
+async fn test_control_only_reconnect_publish_does_not_reenter_disconnect_loop() {
+    assert_control_only_reconnect_publish_stable(false).await;
+}
+
+#[tokio::test]
+async fn test_control_only_clean_session_reconnect_publish_does_not_reenter_disconnect_loop() {
+    assert_control_only_reconnect_publish_stable(true).await;
+}
+
+#[tokio::test]
+async fn test_control_only_clean_session_qos0_burst_after_reconnect_does_not_disconnect() {
+    assert_control_only_reconnect_qos0_burst_stable(false).await;
+}
+
+#[tokio::test]
+async fn test_control_only_secure_clean_session_qos0_burst_after_reconnect_does_not_disconnect() {
+    assert_control_only_reconnect_qos0_burst_stable(true).await;
+}
+
+async fn assert_control_only_reconnect_publish_stable(clean_start: bool) {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let quic_port = if clean_start { 24682 } else { 24681 };
+    let (mut broker, quic_addr) = start_quic_broker(quic_port).await;
+    let mut broker_handle = tokio::spawn(async move { broker.run().await });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let topic = format!("reconnect-control-only/{}", Ulid::new());
+    let sub_opts = ConnectOptions::new(test_client_id("quic-reconnect-sub"))
+        .with_clean_start(clean_start)
+        .with_keep_alive(Duration::from_secs(1))
+        .with_reconnect_delay(Duration::from_millis(100), Duration::from_secs(1));
+    let sub_client = MqttClient::with_options(sub_opts);
+    sub_client.set_insecure_tls(true).await;
+    sub_client
+        .set_quic_stream_strategy(StreamStrategy::ControlOnly)
+        .await;
+
+    let pub_client = MqttClient::new(test_client_id("quic-reconnect-pub"));
+    pub_client.set_insecure_tls(true).await;
+    pub_client
+        .set_quic_stream_strategy(StreamStrategy::ControlOnly)
+        .await;
+
+    let disconnected = Arc::new(AtomicU32::new(0));
+    let disconnected_for_events = disconnected.clone();
+    sub_client
+        .on_connection_event(move |event| {
+            if matches!(event, ConnectionEvent::Disconnected { .. }) {
+                disconnected_for_events.fetch_add(1, Ordering::SeqCst);
+            }
+        })
+        .await
+        .unwrap();
+
+    let received = Arc::new(AtomicU32::new(0));
+    let received_for_callback = received.clone();
+
+    let broker_url = format!("quic://{quic_addr}");
+    sub_client.connect(&broker_url).await.unwrap();
+    pub_client.connect(&broker_url).await.unwrap();
+
+    sub_client
+        .subscribe(&topic, move |_| {
+            received_for_callback.fetch_add(1, Ordering::SeqCst);
+        })
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    broker_handle.abort();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let (mut restarted_broker, restarted_addr) = start_quic_broker(quic_port).await;
+    broker_handle = tokio::spawn(async move { restarted_broker.run().await });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    assert_eq!(restarted_addr, quic_addr);
+    assert!(
+        wait_for_connected(&sub_client, Duration::from_secs(5)).await,
+        "subscriber should reconnect to broker (clean_start={clean_start})"
+    );
+
+    if pub_client.is_connected().await {
+        pub_client.disconnect().await.unwrap();
+    }
+    pub_client.connect(&broker_url).await.unwrap();
+
+    let disconnects_before_publish = disconnected.load(Ordering::SeqCst);
+
+    pub_client
+        .publish_qos1(&topic, b"after-reconnect")
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    assert_eq!(
+        received.load(Ordering::SeqCst),
+        1,
+        "subscriber should receive publish after reconnect (clean_start={clean_start})"
+    );
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    assert!(
+        sub_client.is_connected().await,
+        "subscriber should remain connected after post-reconnect publish (clean_start={clean_start})"
+    );
+    assert_eq!(
+        disconnected.load(Ordering::SeqCst),
+        disconnects_before_publish,
+        "post-reconnect publish should not trigger another disconnect loop (clean_start={clean_start})"
+    );
+
+    pub_client.disconnect().await.unwrap();
+    sub_client.disconnect().await.unwrap();
+    broker_handle.abort();
+}
+
+async fn assert_control_only_reconnect_qos0_burst_stable(secure: bool) {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let quic_port = if secure { 24684 } else { 24683 };
+    let (mut broker, quic_addr) = start_quic_broker(quic_port).await;
+    let mut broker_handle = tokio::spawn(async move { broker.run().await });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let topic = format!("reconnect-control-only-qos0/{}", Ulid::new());
+    let sub_opts = ConnectOptions::new(test_client_id("quic-reconnect-qos0-sub"))
+        .with_clean_start(true)
+        .with_keep_alive(Duration::from_secs(1))
+        .with_reconnect_delay(Duration::from_millis(100), Duration::from_secs(1));
+    let sub_client = MqttClient::with_options(sub_opts);
+    if secure {
+        sub_client.set_insecure_tls(true).await;
+    }
+    sub_client
+        .set_quic_stream_strategy(StreamStrategy::ControlOnly)
+        .await;
+
+    let pub_client = MqttClient::new(test_client_id("quic-reconnect-qos0-pub"));
+    if secure {
+        pub_client.set_insecure_tls(true).await;
+    }
+    pub_client
+        .set_quic_stream_strategy(StreamStrategy::ControlOnly)
+        .await;
+
+    let disconnected = Arc::new(AtomicU32::new(0));
+    let disconnected_for_events = disconnected.clone();
+    sub_client
+        .on_connection_event(move |event| {
+            if matches!(event, ConnectionEvent::Disconnected { .. }) {
+                disconnected_for_events.fetch_add(1, Ordering::SeqCst);
+            }
+        })
+        .await
+        .unwrap();
+
+    let received = Arc::new(AtomicU32::new(0));
+    let received_for_callback = received.clone();
+
+    let broker_url = if secure {
+        format!("quics://{quic_addr}")
+    } else {
+        format!("quic://{quic_addr}")
+    };
+    sub_client.connect(&broker_url).await.unwrap();
+    pub_client.connect(&broker_url).await.unwrap();
+
+    sub_client
+        .subscribe(&topic, move |_| {
+            received_for_callback.fetch_add(1, Ordering::SeqCst);
+        })
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    broker_handle.abort();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let (mut restarted_broker, restarted_addr) = start_quic_broker(quic_port).await;
+    broker_handle = tokio::spawn(async move { restarted_broker.run().await });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    assert_eq!(restarted_addr, quic_addr);
+    assert!(
+        wait_for_connected(&sub_client, Duration::from_secs(5)).await,
+        "subscriber should reconnect to broker (secure={secure})"
+    );
+
+    if pub_client.is_connected().await {
+        pub_client.disconnect().await.unwrap();
+    }
+    pub_client.connect(&broker_url).await.unwrap();
+
+    let disconnects_before_publish = disconnected.load(Ordering::SeqCst);
+
+    for i in 0..6 {
+        pub_client
+            .publish(&topic, format!("after-reconnect-{i}").as_bytes())
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    assert_eq!(
+        received.load(Ordering::SeqCst),
+        6,
+        "subscriber should receive all qos0 messages after reconnect (secure={secure})"
+    );
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    assert!(
+        sub_client.is_connected().await,
+        "subscriber should remain connected after qos0 burst (secure={secure})"
+    );
+    assert_eq!(
+        disconnected.load(Ordering::SeqCst),
+        disconnects_before_publish,
+        "qos0 burst after reconnect should not trigger disconnect loop (secure={secure})"
+    );
+
+    pub_client.disconnect().await.unwrap();
+    sub_client.disconnect().await.unwrap();
+    broker_handle.abort();
 }
 
 #[tokio::test]

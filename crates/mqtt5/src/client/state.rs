@@ -9,6 +9,7 @@ use tokio::time::Duration;
 
 use super::connection::{ConnectionEvent, ReconnectConfig};
 use super::direct::AutomaticReconnectLifecycle;
+use super::direct::{StoredSubscription, SubscriptionPersistence};
 use super::MqttClient;
 
 #[derive(Debug, Clone)]
@@ -49,7 +50,7 @@ impl MqttClient {
 
     pub(crate) async fn restore_subscriptions_after_connect(
         &self,
-        stored_subs: Vec<(String, SubscriptionOptions, CallbackId)>,
+        stored_subs: Vec<StoredSubscription>,
         session_present: bool,
     ) {
         if stored_subs.is_empty() {
@@ -216,19 +217,6 @@ impl MqttClient {
                 Ok(_) => {
                     tracing::info!("Reconnected successfully after {} attempts", attempt);
 
-                    let inner = self.inner.read().await;
-                    let stored_subs = inner.stored_subscriptions.lock().clone();
-                    drop(inner);
-
-                    for (topic, options, callback_id) in stored_subs {
-                        if let Err(e) = self
-                            .resubscribe_internal(&topic, options, callback_id)
-                            .await
-                        {
-                            tracing::warn!("Failed to restore subscription to {}: {}", topic, e);
-                        }
-                    }
-
                     self.send_queued_messages().await;
 
                     return Ok(());
@@ -289,7 +277,9 @@ impl MqttClient {
             properties: Properties::new(),
             protocol_version: inner.options.protocol_version.as_u8(),
         };
-        inner.subscribe_with_callback(packet, callback_id).await?;
+        inner
+            .subscribe_with_callback_internal(packet, callback_id, SubscriptionPersistence::Skip)
+            .await?;
         Ok(())
     }
 

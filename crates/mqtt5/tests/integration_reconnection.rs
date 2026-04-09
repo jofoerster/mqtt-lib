@@ -3,8 +3,12 @@
 mod common;
 
 use common::TestBroker;
+use mqtt5::broker::config::{BrokerConfig, StorageBackend, StorageConfig};
+use mqtt5::broker::{BrokerEventHandler, ClientSubscribeEvent};
 use mqtt5::time::Duration;
 use mqtt5::{ConnectOptions, ConnectionEvent, MqttClient, QoS, SubscribeOptions};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -13,6 +17,35 @@ use ulid::Ulid;
 /// Helper function to get a unique client ID for tests
 fn test_client_id(test_name: &str) -> String {
     format!("test-{test_name}-{}", Ulid::new())
+}
+
+#[derive(Default)]
+struct SubscribeCounter {
+    counts: RwLock<std::collections::HashMap<String, usize>>,
+}
+
+impl SubscribeCounter {
+    fn count_for(&self, client_id: &str) -> usize {
+        self.counts
+            .read()
+            .unwrap()
+            .get(client_id)
+            .copied()
+            .unwrap_or_default()
+    }
+}
+
+impl BrokerEventHandler for SubscribeCounter {
+    fn on_client_subscribe<'a>(
+        &'a self,
+        event: ClientSubscribeEvent,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            let mut counts = self.counts.write().unwrap();
+            let entry = counts.entry(event.client_id.to_string()).or_default();
+            *entry += event.subscriptions.len();
+        })
+    }
 }
 
 #[tokio::test]
@@ -156,8 +189,6 @@ async fn test_client_initiated_disconnect_stops_automatic_reconnection() {
 
     client.disconnect().await.expect("Failed to disconnect");
 
-    // Wait longer than the monitor tick to ensure the old client does not revive
-    // itself after a caller-initiated disconnect.
     tokio::time::sleep(Duration::from_millis(1500)).await;
 
     assert_eq!(disconnected_count.load(Ordering::SeqCst), 1);
@@ -165,7 +196,6 @@ async fn test_client_initiated_disconnect_stops_automatic_reconnection() {
     assert_eq!(connected_count.load(Ordering::SeqCst), 1);
     assert!(!client.is_connected().await);
 
-    // An explicit connect should still create a new lifecycle on the same client.
     client
         .connect(broker.address())
         .await
@@ -229,6 +259,78 @@ async fn test_disconnect_during_inflight_reconnection() {
         "Should not have connected after disconnect"
     );
     assert!(!client.is_connected().await);
+}
+
+#[tokio::test]
+async fn test_reconnect_restores_each_subscription_once() {
+    let event_handler = Arc::new(SubscribeCounter::default());
+    let config = BrokerConfig::default()
+        .with_bind_address("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
+        .with_storage(StorageConfig {
+            backend: StorageBackend::Memory,
+            enable_persistence: true,
+            ..Default::default()
+        })
+        .with_event_handler(event_handler.clone());
+    let mut broker = TestBroker::start_with_config(config).await;
+
+    let client_id = test_client_id("restore-once");
+    let client = MqttClient::new(client_id.clone());
+
+    let connected_count = Arc::new(AtomicU32::new(0));
+    let connected_count_clone = Arc::clone(&connected_count);
+    client
+        .on_connection_event(move |event| {
+            if matches!(event, ConnectionEvent::Connected { .. }) {
+                connected_count_clone.fetch_add(1, Ordering::SeqCst);
+            }
+        })
+        .await
+        .expect("Failed to register connection event handler");
+
+    let opts = ConnectOptions::new(client_id.clone()).with_clean_start(true);
+
+    client
+        .connect_with_options(broker.address(), opts.clone())
+        .await
+        .expect("Failed to connect");
+
+    client
+        .subscribe("test/reconnect-count", |_| {})
+        .await
+        .expect("Failed to subscribe");
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(event_handler.count_for(&client_id), 1);
+
+    client.disconnect().await.expect("Failed to disconnect");
+    client
+        .connect_with_options(broker.address(), opts.clone())
+        .await
+        .expect("Failed to reconnect the first time");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(connected_count.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        event_handler.count_for(&client_id),
+        2,
+        "the first reconnect should restore exactly one subscribe"
+    );
+
+    client.disconnect().await.expect("Failed to disconnect");
+    client
+        .connect_with_options(broker.address(), opts)
+        .await
+        .expect("Failed to reconnect the second time");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(connected_count.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        event_handler.count_for(&client_id),
+        3,
+        "each reconnect should restore exactly one subscribe for the topic"
+    );
+
+    client.disconnect().await.expect("Failed to disconnect");
+    broker.stop().await;
 }
 
 #[tokio::test]

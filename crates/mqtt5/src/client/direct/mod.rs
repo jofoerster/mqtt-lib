@@ -9,7 +9,7 @@ mod unified;
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -61,6 +61,16 @@ pub enum AutomaticReconnectLifecycle {
     Stopped,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SubscriptionPersistence {
+    Persist,
+    Skip,
+}
+
+pub(crate) type StoredSubscription = (String, SubscriptionOptions, CallbackId);
+pub(crate) type StoredSubscriptions = Arc<Mutex<Vec<StoredSubscription>>>;
+pub(crate) type ConnectionEpoch = Arc<AtomicU64>;
+
 pub struct DirectClientInner {
     pub writer: Option<Arc<tokio::sync::Mutex<UnifiedWriter>>>,
     #[cfg(feature = "transport-quic")]
@@ -75,6 +85,7 @@ pub struct DirectClientInner {
     pub quic_stream_manager: Option<Arc<QuicStreamManager>>,
     pub session: Arc<tokio::sync::RwLock<SessionState>>,
     pub connected: Arc<AtomicBool>,
+    pub connection_epoch: ConnectionEpoch,
     pub callback_manager: Arc<CallbackManager>,
     pub packet_reader_handle: Option<JoinHandle<()>>,
     pub keepalive_handle: Option<JoinHandle<()>>,
@@ -93,7 +104,7 @@ pub struct DirectClientInner {
     pub automatic_reconnect_lifecycle: AutomaticReconnectLifecycle,
     pub server_redirect: Option<String>,
     pub queued_messages: Arc<Mutex<Vec<PublishPacket>>>,
-    pub stored_subscriptions: Arc<Mutex<Vec<(String, SubscriptionOptions, CallbackId)>>>,
+    pub stored_subscriptions: StoredSubscriptions,
     pub queue_on_disconnect: bool,
     pub server_max_qos: Arc<Mutex<Option<u8>>>,
     pub auth_handler: Option<Arc<dyn AuthHandler>>,
@@ -130,6 +141,7 @@ impl DirectClientInner {
             quic_stream_manager: None,
             session,
             connected: Arc::new(AtomicBool::new(false)),
+            connection_epoch: Arc::new(AtomicU64::new(0)),
             callback_manager: Arc::new(CallbackManager::new()),
             packet_reader_handle: None,
             keepalive_handle: None,
@@ -171,6 +183,44 @@ impl DirectClientInner {
 
     pub fn set_connected(&self, connected: bool) {
         self.connected.store(connected, Ordering::SeqCst);
+    }
+
+    pub(crate) fn advance_connection_epoch(&self) -> u64 {
+        self.connection_epoch.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    async fn reset_connection_runtime(&mut self, reason: &[u8]) {
+        self.stop_background_tasks();
+        self.keepalive_state.lock().reset();
+
+        #[cfg(feature = "transport-quic")]
+        if let Some(manager) = self.quic_stream_manager.take() {
+            manager.close_all_streams().await;
+        }
+
+        self.writer = None;
+        self.set_connected(false);
+
+        #[cfg(feature = "transport-quic")]
+        if let Some(conn) = self.quic_connection.take() {
+            conn.close(
+                quinn::VarInt::from_u32(mqtt5_protocol::QuicConnectionCode::NoError.code()),
+                reason,
+            );
+        }
+        #[cfg(feature = "transport-quic")]
+        if let Some(endpoint) = self.quic_endpoint.take() {
+            tokio::spawn(async move {
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), endpoint.wait_idle())
+                        .await;
+            });
+        }
+        #[cfg(feature = "transport-quic")]
+        {
+            self.stream_strategy = None;
+            self.quic_datagrams_enabled = false;
+        }
     }
 
     pub fn is_queue_on_disconnect(&self) -> bool {
@@ -279,6 +329,8 @@ impl DirectClientInner {
     ///
     /// Returns an error if the operation fails
     pub async fn connect(&mut self, mut transport: TransportType) -> Result<ConnectResult> {
+        self.reset_connection_runtime(b"reconnect").await;
+
         let connect_packet = self.build_connect_packet().await;
 
         transport
@@ -356,6 +408,7 @@ impl DirectClientInner {
             }
         };
 
+        let connection_epoch = self.advance_connection_epoch();
         self.writer = Some(Arc::new(tokio::sync::Mutex::new(writer)));
         self.set_connected(true);
 
@@ -368,7 +421,7 @@ impl DirectClientInner {
         }
 
         tracing::debug!("Starting background tasks (packet reader and keepalive)");
-        self.start_background_tasks(reader)?;
+        self.start_background_tasks(reader, connection_epoch)?;
         tracing::debug!("Background tasks started successfully");
 
         Ok(ConnectResult {
@@ -440,35 +493,7 @@ impl DirectClientInner {
             }
         }
 
-        self.stop_background_tasks();
-
-        #[cfg(feature = "transport-quic")]
-        if let Some(manager) = self.quic_stream_manager.take() {
-            manager.close_all_streams().await;
-        }
-
-        self.set_connected(false);
-        self.writer = None;
-        #[cfg(feature = "transport-quic")]
-        if let Some(conn) = self.quic_connection.take() {
-            conn.close(
-                quinn::VarInt::from_u32(mqtt5_protocol::QuicConnectionCode::NoError.code()),
-                b"disconnect",
-            );
-        }
-        #[cfg(feature = "transport-quic")]
-        if let Some(endpoint) = self.quic_endpoint.take() {
-            tokio::spawn(async move {
-                let _ =
-                    tokio::time::timeout(std::time::Duration::from_secs(2), endpoint.wait_idle())
-                        .await;
-            });
-        }
-        #[cfg(feature = "transport-quic")]
-        {
-            self.stream_strategy = None;
-            self.quic_datagrams_enabled = false;
-        }
+        self.reset_connection_runtime(b"disconnect").await;
 
         Ok(())
     }
@@ -891,6 +916,19 @@ impl DirectClientInner {
         packet: SubscribePacket,
         callback_id: CallbackId,
     ) -> Result<Vec<(u16, QoS)>> {
+        self.subscribe_with_callback_internal(packet, callback_id, SubscriptionPersistence::Persist)
+            .await
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error if the operation fails
+    pub(crate) async fn subscribe_with_callback_internal(
+        &self,
+        packet: SubscribePacket,
+        callback_id: CallbackId,
+        persistence: SubscriptionPersistence,
+    ) -> Result<Vec<(u16, QoS)>> {
         if !self.is_connected() {
             return Err(MqttError::NotConnected);
         }
@@ -904,13 +942,12 @@ impl DirectClientInner {
         let (tx, rx) = oneshot::channel();
         self.pending_subacks.lock().insert(packet_id, tx);
 
-        for filter in &packet.filters {
-            self.stored_subscriptions.lock().push((
-                filter.filter.clone(),
-                filter.options,
-                callback_id,
-            ));
-        }
+        maybe_store_subscriptions(
+            &self.stored_subscriptions,
+            &packet.filters,
+            callback_id,
+            persistence,
+        );
 
         #[cfg(feature = "transport-quic")]
         let sent_on_flow = if self.should_subscribe_on_data_flow(&packet) {
@@ -1121,7 +1158,11 @@ impl DirectClientInner {
         will.map_or_else(Properties::default, |w| w.properties.clone().into())
     }
 
-    fn start_background_tasks(&mut self, reader: UnifiedReader) -> Result<()> {
+    fn start_background_tasks(
+        &mut self,
+        reader: UnifiedReader,
+        connection_epoch: u64,
+    ) -> Result<()> {
         let reader_session = self.session.clone();
         let reader_callbacks = self.callback_manager.clone();
         let suback_channels = self.pending_subacks.clone();
@@ -1143,6 +1184,8 @@ impl DirectClientInner {
             pubcomp_channels,
             writer: writer_for_reader,
             connected,
+            connection_epoch,
+            current_connection_epoch: self.connection_epoch.clone(),
             #[cfg(feature = "transport-quic")]
             protocol_version: self.options.protocol_version.as_u8(),
             auth_handler: self.auth_handler.clone(),
@@ -1165,6 +1208,7 @@ impl DirectClientInner {
             let keepalive_writer = writer_for_keepalive;
             let keepalive_connected = self.connected.clone();
             let keepalive_config = self.options.keepalive_config;
+            let current_connection_epoch = self.connection_epoch.clone();
             self.keepalive_handle = Some(tokio::spawn(async move {
                 tracing::debug!("💓 KEEPALIVE - Task starting");
                 keepalive_task_with_writer(
@@ -1172,6 +1216,8 @@ impl DirectClientInner {
                     keepalive_interval,
                     keepalive_state,
                     keepalive_connected,
+                    connection_epoch,
+                    current_connection_epoch,
                     keepalive_config,
                 )
                 .await;
@@ -1298,6 +1344,22 @@ impl DirectClientInner {
     }
 }
 
+fn maybe_store_subscriptions(
+    stored_subscriptions: &StoredSubscriptions,
+    filters: &[TopicFilter],
+    callback_id: CallbackId,
+    persistence: SubscriptionPersistence,
+) {
+    if persistence == SubscriptionPersistence::Skip {
+        return;
+    }
+
+    let mut stored = stored_subscriptions.lock();
+    for filter in filters {
+        stored.push((filter.filter.clone(), filter.options, callback_id));
+    }
+}
+
 #[cfg(test)]
 pub mod tests {
     use super::*;
@@ -1398,6 +1460,29 @@ pub mod tests {
 
         let result = client.subscribe_with_callback(packet, 0).await;
         assert!(matches!(result, Err(MqttError::NotConnected)));
+    }
+
+    #[test]
+    fn test_subscribe_internal_can_skip_persisting_stored_subscriptions() {
+        let stored = Arc::new(Mutex::new(Vec::new()));
+        let filters = vec![TopicFilter {
+            filter: "test/topic".to_string(),
+            options: SubscriptionOptions {
+                qos: QoS::AtLeastOnce,
+                no_local: false,
+                retain_as_published: false,
+                retain_handling: crate::packet::subscribe::RetainHandling::SendAtSubscribe,
+            },
+        }];
+
+        maybe_store_subscriptions(&stored, &filters, 7, SubscriptionPersistence::Skip);
+        assert!(stored.lock().is_empty());
+
+        maybe_store_subscriptions(&stored, &filters, 7, SubscriptionPersistence::Persist);
+        let stored = stored.lock();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].0, "test/topic");
+        assert_eq!(stored[0].2, 7);
     }
 
     #[tokio::test]

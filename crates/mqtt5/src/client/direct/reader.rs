@@ -13,12 +13,12 @@ use crate::session::SessionState;
 use crate::transport::PacketWriter;
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 use tokio::sync::oneshot;
 
 use super::handlers::handle_incoming_packet_with_writer;
-use super::keepalive::KeepaliveState;
+use super::keepalive::{mark_disconnected_if_current, owns_current_connection, KeepaliveState};
 use super::unified::{UnifiedReader, UnifiedWriter};
 
 #[cfg(feature = "transport-quic")]
@@ -44,12 +44,38 @@ pub(super) struct PacketReaderContext {
     pub(super) pubcomp_channels: Arc<Mutex<HashMap<u16, oneshot::Sender<ReasonCode>>>>,
     pub(super) writer: Arc<tokio::sync::Mutex<UnifiedWriter>>,
     pub(super) connected: Arc<AtomicBool>,
+    pub(super) connection_epoch: u64,
+    pub(super) current_connection_epoch: Arc<AtomicU64>,
     #[cfg(feature = "transport-quic")]
     pub(super) protocol_version: u8,
     pub(super) auth_handler: Option<Arc<dyn AuthHandler>>,
     pub(super) auth_method: Option<String>,
     pub(super) keepalive_state: Arc<Mutex<KeepaliveState>>,
     pub(super) codec_registry: Option<Arc<CodecRegistry>>,
+}
+
+impl PacketReaderContext {
+    fn owns_current_connection(&self) -> bool {
+        owns_current_connection(self.connection_epoch, &self.current_connection_epoch)
+    }
+
+    fn mark_disconnected_if_current(&self) {
+        mark_disconnected_if_current(
+            &self.connected,
+            self.connection_epoch,
+            &self.current_connection_epoch,
+        );
+    }
+
+    fn clear_pending_if_current(&self) {
+        if !self.owns_current_connection() {
+            return;
+        }
+        self.puback_channels.lock().drain();
+        self.pubcomp_channels.lock().drain();
+        self.suback_channels.lock().drain();
+        self.unsuback_channels.lock().drain();
+    }
 }
 
 pub(super) async fn packet_reader_task_with_responses(
@@ -109,7 +135,7 @@ pub(super) async fn packet_reader_task_with_responses(
                     Packet::Auth(ref auth) => {
                         if let Err(e) = handle_auth_packet(auth.clone(), &ctx).await {
                             tracing::error!("Error handling AUTH packet: {e}");
-                            ctx.connected.store(false, Ordering::SeqCst);
+                            ctx.mark_disconnected_if_current();
                             break;
                         }
                         continue;
@@ -129,24 +155,20 @@ pub(super) async fn packet_reader_task_with_responses(
                 .await
                 {
                     tracing::error!("Error handling packet: {e}");
-                    ctx.connected.store(false, Ordering::SeqCst);
+                    ctx.mark_disconnected_if_current();
                     break;
                 }
             }
             Err(e) => {
                 tracing::error!("Error reading packet: {e}");
-                ctx.connected.store(false, Ordering::SeqCst);
+                ctx.mark_disconnected_if_current();
                 break;
             }
         }
     }
 
-    ctx.connected.store(false, Ordering::SeqCst);
-
-    ctx.puback_channels.lock().drain();
-    ctx.pubcomp_channels.lock().drain();
-    ctx.suback_channels.lock().drain();
-    ctx.unsuback_channels.lock().drain();
+    ctx.mark_disconnected_if_current();
+    ctx.clear_pending_if_current();
 }
 
 async fn handle_auth_packet(auth: AuthPacket, ctx: &PacketReaderContext) -> Result<()> {
@@ -220,7 +242,7 @@ pub(super) async fn quic_stream_acceptor_task(
                     Err(e) => {
                         let reason = crate::transport::quic_error::parse_connection_error(&e);
                         tracing::error!("QUIC uni stream accept ended: {reason}");
-                        ctx.connected.store(false, Ordering::SeqCst);
+                        ctx.mark_disconnected_if_current();
                         break;
                     }
                 }
@@ -237,7 +259,7 @@ pub(super) async fn quic_stream_acceptor_task(
                     Err(e) => {
                         let reason = crate::transport::quic_error::parse_connection_error(&e);
                         tracing::error!("QUIC bi stream accept ended: {reason}");
-                        ctx.connected.store(false, Ordering::SeqCst);
+                        ctx.mark_disconnected_if_current();
                         break;
                     }
                 }
@@ -551,5 +573,16 @@ async fn quic_uni_stream_reader_task(mut recv: quinn::RecvStream, ctx: PacketRea
                 break;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::owns_current_connection;
+    use std::sync::atomic::AtomicU64;
+
+    #[test]
+    fn stale_epoch_does_not_own_current_connection() {
+        assert!(!owns_current_connection(1, &AtomicU64::new(2)));
     }
 }
