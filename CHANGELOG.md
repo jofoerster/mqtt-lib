@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [mqtt5 0.31.2] - 2026-04-09
+
+### Fixed
+
+- **Reconnect lifecycle hardening** - connection epoch guards prevent stale keepalive/reader tasks from disconnecting newer connections; QUIC close frame now carries semantic reason (`reconnect` vs `disconnect`); subscription restore no longer duplicates on reconnect
+- **Epoch and pending-channel helpers consolidated** - `owns_current_connection` and `mark_disconnected_if_current` moved to single source in keepalive module; `clear_pending_if_current` inlined into `PacketReaderContext`
+
 ## [mqttv5-cli 0.27.0] - 2026-03-29
 
 ### Added
