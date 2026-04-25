@@ -18,6 +18,7 @@ pub fn spawn(task: impl Future<Output = ()> + 'static) {
 }
 
 /// Yield control back to the executor so other tasks can run.
+#[must_use]
 pub fn yield_now() -> YieldNow {
     YieldNow { yielded: false }
 }
