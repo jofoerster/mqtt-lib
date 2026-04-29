@@ -1,16 +1,30 @@
 use mqtt5::broker::config::BrokerConfig;
+use mqtt5::broker::events::BrokerEventHandler;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Configuration for the standalone WASI MQTT broker.
 ///
 /// Wraps the subset of [`BrokerConfig`] options that are meaningful in the
 /// WASI environment (no TLS, no persistent storage, no clustering).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct WasiBrokerConfig {
     /// Allow clients to connect without authentication.
     pub allow_anonymous: bool,
     /// Maximum number of concurrent connected clients.
     pub max_clients: usize,
+    /// Optional handler invoked for broker lifecycle events
+    pub event_handler: Option<Arc<dyn BrokerEventHandler>>,
+}
+
+impl std::fmt::Debug for WasiBrokerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WasiBrokerConfig")
+            .field("allow_anonymous", &self.allow_anonymous)
+            .field("max_clients", &self.max_clients)
+            .field("event_handler", &self.event_handler.as_ref().map(|_| "..."))
+            .finish()
+    }
 }
 
 impl Default for WasiBrokerConfig {
@@ -18,14 +32,22 @@ impl Default for WasiBrokerConfig {
         Self {
             allow_anonymous: true,
             max_clients: 1000,
+            event_handler: None,
         }
     }
 }
 
 impl WasiBrokerConfig {
+    #[must_use]
+    pub fn with_event_handler(mut self, handler: Arc<dyn BrokerEventHandler>) -> Self {
+        self.event_handler = Some(handler);
+        self
+    }
+
     pub(crate) fn to_broker_config(&self) -> BrokerConfig {
         BrokerConfig {
             max_clients: self.max_clients,
+            event_handler: self.event_handler.clone(),
             ..BrokerConfig::default()
         }
     }

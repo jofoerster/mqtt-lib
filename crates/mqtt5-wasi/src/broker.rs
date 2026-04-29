@@ -53,10 +53,17 @@ impl WasiBroker {
         } else {
             base_router
         };
-        let router = if broker_config.max_outbound_rate_per_client > 0 {
-            Arc::new(with_echo.with_max_outbound_rate(broker_config.max_outbound_rate_per_client))
+        let with_handler = if let Some(ref handler) = broker_config.event_handler {
+            with_echo.with_event_handler(Arc::clone(handler))
         } else {
-            Arc::new(with_echo)
+            with_echo
+        };
+        let router = if broker_config.max_outbound_rate_per_client > 0 {
+            Arc::new(
+                with_handler.with_max_outbound_rate(broker_config.max_outbound_rate_per_client),
+            )
+        } else {
+            Arc::new(with_handler)
         };
         drop(broker_config);
 

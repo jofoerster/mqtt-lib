@@ -21,3 +21,13 @@ pub use broker::WasiBroker;
 #[cfg(target_os = "wasi")]
 pub use client::WasiClient;
 pub use config::{WasiBrokerConfig, WasiClientConfig};
+
+/// Re-exports of broker lifecycle event types so that consumers of this crate
+/// do not need to add a direct dependency on `mqtt5`
+pub mod events {
+    pub use mqtt5::broker::events::{
+        BrokerEventHandler, ClientConnectEvent, ClientDisconnectEvent, ClientPublishEvent,
+        ClientSubscribeEvent, ClientUnsubscribeEvent, MessageDeliveredEvent, PublishAction,
+        RetainedSetEvent, SubAckReasonCode, SubscriptionInfo,
+    };
+}
