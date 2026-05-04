@@ -17,8 +17,8 @@ Standalone MQTT v5.0 / v3.1.1 **broker and client** that run as WebAssembly comp
 ## Quick Start (broker)
 
 ```bash
-# Build the broker
-cargo build -p mqtt5-wasi --target wasm32-wasip2 --release
+# Build the broker binary
+cargo build -p mqtt5-wasi --bin mqtt5-broker --target wasm32-wasip2 --release
 
 # Run with wasmtime (v43+ recommended)
 wasmtime run -S inherit-network \
@@ -31,7 +31,7 @@ mosquitto_sub -h 127.0.0.1 -p 1883 -t "test/#" -v
 mosquitto_pub -h 127.0.0.1 -p 1883 -t "test/hello" -m "hello from wasi"
 ```
 
-The bind address defaults to `0.0.0.0:1883` and can be changed via the `MQTT_BIND` environment variable.
+The bind address defaults to `0.0.0.0:1883` and can be changed via the `MQTT_BIND` environment variable (pass it through with `wasmtime run --env MQTT_BIND=0.0.0.0:11883 ...`).
 
 ## Broker usage
 
