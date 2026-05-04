@@ -37,7 +37,7 @@ impl WasiClientHandler {
                     reason_code: ReasonCode::ProtocolError,
                     properties: mqtt5_protocol::protocol::v5::properties::Properties::default(),
                 };
-                self.write_packet(&Packet::Disconnect(disconnect), stream)?;
+                self.write_packet(&Packet::Disconnect(disconnect), stream).await?;
                 return Err(MqttError::ProtocolError(
                     "NoLocal on shared subscription".to_string(),
                 ));
@@ -116,7 +116,7 @@ impl WasiClientHandler {
         suback.reason_codes = reason_codes;
         suback.protocol_version = self.protocol_version;
 
-        self.write_packet(&Packet::SubAck(suback), stream)?;
+        self.write_packet(&Packet::SubAck(suback), stream).await?;
 
         debug!("Client {client_id} subscribed to topics");
         Ok(())
@@ -181,7 +181,7 @@ impl WasiClientHandler {
             let retained = self.router.get_retained_messages(&filter.filter).await;
             for mut msg in retained {
                 msg.retain = true;
-                self.send_publish(msg, stream)?;
+                self.send_publish(msg, stream).await?;
             }
         }
         Ok(())
@@ -216,7 +216,7 @@ impl WasiClientHandler {
         unsuback.reason_codes = reason_codes;
         unsuback.protocol_version = self.protocol_version;
 
-        self.write_packet(&Packet::UnsubAck(unsuback), stream)?;
+        self.write_packet(&Packet::UnsubAck(unsuback), stream).await?;
 
         Ok(())
     }
@@ -236,7 +236,7 @@ impl WasiClientHandler {
             );
             for msg in queued_messages {
                 let publish = msg.to_publish_packet();
-                self.send_publish(publish, stream)?;
+                self.send_publish(publish, stream).await?;
             }
         }
         Ok(())

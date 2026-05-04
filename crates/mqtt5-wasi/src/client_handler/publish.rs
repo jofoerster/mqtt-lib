@@ -35,7 +35,7 @@ impl WasiClientHandler {
                 "Client {client_id} not authorized to publish to {}",
                 publish.topic_name
             );
-            self.reject_publish(&publish, ReasonCode::NotAuthorized, stream)?;
+            self.reject_publish(&publish, ReasonCode::NotAuthorized, stream).await?;
             return Ok(());
         }
 
@@ -51,7 +51,7 @@ impl WasiClientHandler {
                 "Client {client_id} sent QoS {} but max is {max_qos}",
                 publish.qos as u8
             );
-            self.reject_publish(&publish, ReasonCode::QoSNotSupported, stream)?;
+            self.reject_publish(&publish, ReasonCode::QoSNotSupported, stream).await?;
             return Ok(());
         }
 
@@ -62,7 +62,7 @@ impl WasiClientHandler {
             .await
         {
             warn!("Client {client_id} exceeded quota");
-            self.reject_publish(&publish, ReasonCode::QuotaExceeded, stream)?;
+            self.reject_publish(&publish, ReasonCode::QuotaExceeded, stream).await?;
             return Ok(());
         }
 
@@ -78,7 +78,7 @@ impl WasiClientHandler {
             QoS::AtLeastOnce => {
                 self.router.route_message(&publish, Some(client_id)).await;
                 let puback = PubAckPacket::new(publish.packet_id.unwrap());
-                self.write_packet(&Packet::PubAck(puback), stream)?;
+                self.write_packet(&Packet::PubAck(puback), stream).await?;
             }
             QoS::ExactlyOnce => {
                 let packet_id = publish.packet_id.unwrap();
@@ -93,14 +93,14 @@ impl WasiClientHandler {
                 }
                 self.inflight_publishes.insert(packet_id, publish);
                 let pubrec = PubRecPacket::new(packet_id);
-                self.write_packet(&Packet::PubRec(pubrec), stream)?;
+                self.write_packet(&Packet::PubRec(pubrec), stream).await?;
             }
         }
 
         Ok(())
     }
 
-    fn reject_publish(
+    async fn reject_publish(
         &self,
         publish: &PublishPacket,
         reason_code: ReasonCode,
@@ -111,12 +111,12 @@ impl WasiClientHandler {
                 QoS::AtLeastOnce => {
                     let mut puback = PubAckPacket::new(packet_id);
                     puback.reason_code = reason_code;
-                    self.write_packet(&Packet::PubAck(puback), stream)?;
+                    self.write_packet(&Packet::PubAck(puback), stream).await?;
                 }
                 QoS::ExactlyOnce => {
                     let mut pubrec = PubRecPacket::new(packet_id);
                     pubrec.reason_code = reason_code;
-                    self.write_packet(&Packet::PubRec(pubrec), stream)?;
+                    self.write_packet(&Packet::PubRec(pubrec), stream).await?;
                 }
                 QoS::AtMostOnce => {}
             }
@@ -158,7 +158,7 @@ impl WasiClientHandler {
             }
         }
         let pubrel = PubRelPacket::new(pubrec.packet_id);
-        self.write_packet(&Packet::PubRel(pubrel), stream)?;
+        self.write_packet(&Packet::PubRel(pubrel), stream).await?;
         Ok(())
     }
 
@@ -180,7 +180,7 @@ impl WasiClientHandler {
         };
 
         let pubcomp = PubCompPacket::new_with_reason(pubrel.packet_id, reason_code);
-        self.write_packet(&Packet::PubComp(pubcomp), stream)?;
+        self.write_packet(&Packet::PubComp(pubcomp), stream).await?;
         Ok(())
     }
 
@@ -215,7 +215,7 @@ impl WasiClientHandler {
                         self.outbound_inflight
                             .borrow_mut()
                             .insert(msg.packet_id, publish.clone());
-                        self.write_packet(&Packet::Publish(publish), stream)?;
+                        self.write_packet(&Packet::Publish(publish), stream).await?;
                     }
                     InflightPhase::AwaitingPubcomp => {
                         let publish = msg.to_publish_packet();
@@ -223,7 +223,7 @@ impl WasiClientHandler {
                             .borrow_mut()
                             .insert(msg.packet_id, publish);
                         let pubrel = PubRelPacket::new(msg.packet_id);
-                        self.write_packet(&Packet::PubRel(pubrel), stream)?;
+                        self.write_packet(&Packet::PubRel(pubrel), stream).await?;
                     }
                     InflightPhase::AwaitingPubrel => {}
                 },
@@ -236,14 +236,21 @@ impl WasiClientHandler {
         Ok(())
     }
 
-    pub(super) fn send_publish(&self, publish: PublishPacket, stream: &WasiStream) -> Result<()> {
-        self.write_packet(&Packet::Publish(publish), stream)
+    pub(super) async fn send_publish(
+        &self,
+        publish: PublishPacket,
+        stream: &WasiStream,
+    ) -> Result<()> {
+        self.write_packet(&Packet::Publish(publish), stream).await
     }
 
-    pub(super) fn write_publish_packet(publish: &PublishPacket, stream: &WasiStream) -> Result<()> {
+    pub(super) async fn write_publish_packet(
+        publish: &PublishPacket,
+        stream: &WasiStream,
+    ) -> Result<()> {
         let mut buf = BytesMut::new();
         publish.encode(&mut buf)?;
-        stream.write(&buf)?;
+        stream.write(&buf).await?;
         Ok(())
     }
 }

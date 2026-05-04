@@ -14,20 +14,18 @@ use mqtt5_protocol::packet::{MqttPacket, Packet};
 use mqtt5_protocol::types::{ConnectOptions, ProtocolVersion};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
-use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
-use wasi::sockets::instance_network::instance_network;
-use wasi::sockets::ip_name_lookup::resolve_addresses;
-use wasi::sockets::network::{IpAddress, IpAddressFamily, IpSocketAddress, Ipv4SocketAddress, Ipv6SocketAddress};
-use wasi::sockets::tcp_create_socket::create_tcp_socket;
+use wstd::net::TcpStream;
+use wstd::runtime::spawn;
+use wstd::task::sleep;
 
 /// Standalone WASI MQTT v5.0 / v3.1.1 client.
 ///
-/// Uses the native `wasi:sockets/tcp` API with non-blocking I/O on the same
-/// cooperative executor that powers the WASI broker. Reuses the [`WasiStream`]
-/// transport and [`read_packet`] decoder so the wire-level behaviour is
+/// Uses [`wstd::net::TcpStream`] for non-blocking TCP I/O on the same
+/// `wstd::runtime` reactor that powers the WASI broker. Reuses
+/// [`WasiStream`] and [`read_packet`] so the wire-level behaviour is
 /// identical to the broker's connection handling.
 pub struct WasiClient {
     stream: Rc<WasiStream>,
@@ -46,8 +44,8 @@ pub struct WasiClient {
 impl WasiClient {
     /// Connect to a broker at `broker_addr` (`host:port` or `ip:port`) and wait for CONNACK.
     ///
-    /// Spawns a background keep-alive task on the executor. Must be called from
-    /// inside [`crate::executor::block_on`].
+    /// Spawns a background keep-alive task on the `wstd::runtime` reactor.
+    /// Must be called from inside [`wstd::runtime::block_on`].
     ///
     /// # Errors
     /// Returns an error if name resolution, the TCP connect, or the CONNACK fails.
@@ -59,10 +57,13 @@ impl WasiClient {
             )));
         }
 
-        let stream = Rc::new(tcp_connect(broker_addr).await?);
+        let tcp = TcpStream::connect(broker_addr)
+            .await
+            .map_err(|e| MqttError::Io(format!("WASI connect error: {e}")))?;
+        let stream = Rc::new(WasiStream::new(tcp));
 
         let connect_packet = build_connect_packet(config);
-        write_packet(&Packet::Connect(Box::new(connect_packet)), &stream)?;
+        write_packet(&Packet::Connect(Box::new(connect_packet)), &stream).await?;
 
         let connack = match read_packet(&stream, config.protocol_version).await? {
             Packet::ConnAck(c) => c,
@@ -118,16 +119,16 @@ impl WasiClient {
         loop {
             match read_packet(&self.stream, self.protocol_version).await {
                 Ok(Packet::Publish(publish)) => {
-                    if let Some(msg) = self.handle_inbound_publish(publish)? {
+                    if let Some(msg) = self.handle_inbound_publish(publish).await? {
                         return Ok(Some(msg));
                     }
                 }
                 Ok(Packet::PubAck(ref puback)) => {
                     self.outbound_inflight.remove(&puback.packet_id);
                 }
-                Ok(Packet::PubRec(pubrec)) => self.handle_pubrec(&pubrec)?,
+                Ok(Packet::PubRec(pubrec)) => self.handle_pubrec(&pubrec).await?,
                 Ok(Packet::PubRel(pubrel)) => {
-                    if let Some(msg) = self.handle_pubrel(&pubrel)? {
+                    if let Some(msg) = self.handle_pubrel(&pubrel).await? {
                         return Ok(Some(msg));
                     }
                 }
@@ -152,10 +153,10 @@ impl WasiClient {
     ///
     /// # Errors
     /// Returns an error if writing the DISCONNECT packet fails.
-    pub fn disconnect(self) -> Result<()> {
+    pub async fn disconnect(self) -> Result<()> {
         *self.keepalive_running.borrow_mut() = false;
         let disconnect = DisconnectPacket::normal();
-        write_packet(&Packet::Disconnect(disconnect), &self.stream)?;
+        write_packet(&Packet::Disconnect(disconnect), &self.stream).await?;
         Ok(())
     }
 
@@ -165,8 +166,8 @@ impl WasiClient {
         id
     }
 
-    pub(super) fn write(&self, packet: &Packet) -> Result<()> {
-        write_packet(packet, &self.stream)?;
+    pub(super) async fn write(&self, packet: &Packet) -> Result<()> {
+        write_packet(packet, &self.stream).await?;
         self.last_send.set(Instant::now());
         Ok(())
     }
@@ -185,16 +186,16 @@ impl WasiClient {
             }
             match packet {
                 Packet::Publish(publish) => {
-                    if let Some(msg) = self.handle_inbound_publish(publish)? {
+                    if let Some(msg) = self.handle_inbound_publish(publish).await? {
                         self.pending_messages.push_back(msg);
                     }
                 }
                 Packet::PubAck(ref puback) => {
                     self.outbound_inflight.remove(&puback.packet_id);
                 }
-                Packet::PubRec(pubrec) => self.handle_pubrec(&pubrec)?,
+                Packet::PubRec(pubrec) => self.handle_pubrec(&pubrec).await?,
                 Packet::PubRel(pubrel) => {
-                    if let Some(msg) = self.handle_pubrel(&pubrel)? {
+                    if let Some(msg) = self.handle_pubrel(&pubrel).await? {
                         self.pending_messages.push_back(msg);
                     }
                 }
@@ -225,9 +226,9 @@ impl WasiClient {
         let last_send = Rc::clone(&self.last_send);
         let running = Rc::clone(&self.keepalive_running);
 
-        crate::executor::spawn(async move {
+        spawn(async move {
             loop {
-                crate::timer::sleep(Duration::from_secs(1)).await;
+                sleep(wstd::time::Duration::from_secs(1)).await;
                 if !*running.borrow() {
                     break;
                 }
@@ -238,14 +239,15 @@ impl WasiClient {
                 if PingReqPacket::default().encode(&mut buf).is_err() {
                     break;
                 }
-                if stream.write(&buf).is_err() {
+                if stream.write(&buf).await.is_err() {
                     *running.borrow_mut() = false;
                     break;
                 }
                 last_send.set(Instant::now());
                 debug!("Sent PINGREQ");
             }
-        });
+        })
+        .detach();
     }
 }
 
@@ -255,7 +257,7 @@ impl Drop for WasiClient {
     }
 }
 
-pub(super) fn write_packet(packet: &Packet, stream: &WasiStream) -> Result<()> {
+pub(super) async fn write_packet(packet: &Packet, stream: &WasiStream) -> Result<()> {
     let mut buf = BytesMut::new();
     match packet {
         Packet::Connect(p) => p.encode(&mut buf)?,
@@ -275,7 +277,7 @@ pub(super) fn write_packet(packet: &Packet, stream: &WasiStream) -> Result<()> {
             )));
         }
     }
-    stream.write(&buf)
+    stream.write(&buf).await
 }
 
 fn build_connect_packet(config: &WasiClientConfig) -> ConnectPacket {
@@ -293,131 +295,5 @@ fn build_connect_packet(config: &WasiClientConfig) -> ConnectPacket {
         ConnectPacket::new_v311(options)
     } else {
         ConnectPacket::new(options)
-    }
-}
-
-async fn tcp_connect(addr: &str) -> Result<WasiStream> {
-    let (host, port) = parse_host_port(addr)?;
-
-    let network = instance_network();
-
-    let remote = if let Ok(socket_addr) = host.parse::<SocketAddr>() {
-        to_wasi_addr(socket_addr)
-    } else {
-        resolve_host(&network, &host, port).await?
-    };
-
-    let family = match &remote {
-        IpSocketAddress::Ipv4(_) => IpAddressFamily::Ipv4,
-        IpSocketAddress::Ipv6(_) => IpAddressFamily::Ipv6,
-    };
-    let socket = create_tcp_socket(family)
-        .map_err(|e| MqttError::Io(format!("WASI create_tcp_socket error: {e:?}")))?;
-
-    socket
-        .start_connect(&network, remote)
-        .map_err(|e| MqttError::Io(format!("WASI start_connect error: {e:?}")))?;
-
-    let (input, output) = loop {
-        if !socket.subscribe().ready() {
-            crate::executor::yield_now().await;
-            continue;
-        }
-        match socket.finish_connect() {
-            Ok(streams) => break streams,
-            Err(wasi::sockets::network::ErrorCode::WouldBlock) => {
-                crate::executor::yield_now().await;
-            }
-            Err(e) => {
-                return Err(MqttError::Io(format!("WASI finish_connect error: {e:?}")));
-            }
-        }
-    };
-
-    Ok(WasiStream::new(socket, input, output))
-}
-
-async fn resolve_host(
-    network: &wasi::sockets::network::Network,
-    host: &str,
-    port: u16,
-) -> Result<IpSocketAddress> {
-    let resolver = resolve_addresses(network, host)
-        .map_err(|e| MqttError::Io(format!("WASI resolve_addresses error: {e:?}")))?;
-    loop {
-        if !resolver.subscribe().ready() {
-            crate::executor::yield_now().await;
-            continue;
-        }
-        match resolver.resolve_next_address() {
-            Ok(Some(ip)) => return Ok(ip_with_port(ip, port)),
-            Ok(None) => {
-                return Err(MqttError::Io(format!(
-                    "No addresses resolved for host '{host}'"
-                )));
-            }
-            Err(wasi::sockets::network::ErrorCode::WouldBlock) => {
-                crate::executor::yield_now().await;
-            }
-            Err(e) => {
-                return Err(MqttError::Io(format!("WASI resolve error: {e:?}")));
-            }
-        }
-    }
-}
-
-fn parse_host_port(addr: &str) -> Result<(String, u16)> {
-    if let Some(rest) = addr.strip_prefix('[') {
-        // IPv6 in brackets: [::1]:1883
-        let (host, port_part) = rest
-            .split_once("]:")
-            .ok_or_else(|| MqttError::ProtocolError(format!("Invalid IPv6 address: {addr}")))?;
-        let port = port_part
-            .parse::<u16>()
-            .map_err(|_| MqttError::ProtocolError(format!("Invalid port in {addr}")))?;
-        return Ok((host.to_string(), port));
-    }
-    let (host, port_part) = addr
-        .rsplit_once(':')
-        .ok_or_else(|| MqttError::ProtocolError(format!("Address must be host:port: {addr}")))?;
-    let port = port_part
-        .parse::<u16>()
-        .map_err(|_| MqttError::ProtocolError(format!("Invalid port in {addr}")))?;
-    Ok((host.to_string(), port))
-}
-
-fn to_wasi_addr(addr: SocketAddr) -> IpSocketAddress {
-    match addr {
-        SocketAddr::V4(v4) => {
-            let o = v4.ip().octets();
-            IpSocketAddress::Ipv4(Ipv4SocketAddress {
-                port: v4.port(),
-                address: (o[0], o[1], o[2], o[3]),
-            })
-        }
-        SocketAddr::V6(v6) => {
-            let s = v6.ip().segments();
-            IpSocketAddress::Ipv6(Ipv6SocketAddress {
-                port: v6.port(),
-                flow_info: 0,
-                address: (s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]),
-                scope_id: 0,
-            })
-        }
-    }
-}
-
-fn ip_with_port(ip: IpAddress, port: u16) -> IpSocketAddress {
-    match ip {
-        IpAddress::Ipv4(addr) => IpSocketAddress::Ipv4(Ipv4SocketAddress {
-            port,
-            address: addr,
-        }),
-        IpAddress::Ipv6(addr) => IpSocketAddress::Ipv6(Ipv6SocketAddress {
-            port,
-            flow_info: 0,
-            address: addr,
-            scope_id: 0,
-        }),
     }
 }

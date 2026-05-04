@@ -2,8 +2,6 @@
 #![cfg_attr(not(target_os = "wasi"), allow(dead_code))]
 
 mod config;
-pub mod executor;
-pub mod timer;
 
 #[cfg(target_os = "wasi")]
 mod broker;
@@ -21,6 +19,13 @@ pub use broker::WasiBroker;
 #[cfg(target_os = "wasi")]
 pub use client::WasiClient;
 pub use config::{WasiBrokerConfig, WasiClientConfig};
+
+/// Re-export of the [`wstd`] async runtime used by this crate.
+///
+/// Use `mqtt5_wasi::wstd::runtime::block_on` to drive the broker / client and
+/// `mqtt5_wasi::wstd::runtime::spawn` / `mqtt5_wasi::wstd::task::sleep` to mix
+/// your own async code into the same single-threaded reactor.
+pub use wstd;
 
 /// Re-exports of broker lifecycle event types so that consumers of this crate
 /// do not need to add a direct dependency on `mqtt5`

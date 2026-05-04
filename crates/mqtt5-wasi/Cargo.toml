@@ -2,7 +2,7 @@
 name = "mqtt5-wasi"
 version = "0.1.0"
 edition.workspace = true
-rust-version.workspace = true
+rust-version = "1.91"
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -25,5 +25,7 @@ getrandom = "0.3"
 # tokio sync is needed because MessageRouter::register_client takes tokio::sync::oneshot::Sender
 tokio = { version = "1.47", features = ["sync"] }
 
-# Raw WASI bindings for non-blocking sockets and polling
-wasi = "0.14"
+# WASI 0.2 async runtime: provides block_on, spawn, TcpListener, TcpStream, sleep,
+# AsyncRead/AsyncWrite. Re-exported from this crate so consumers can drive their
+# own async code on the same scheduler that powers the broker and client.
+wstd = "0.6"

@@ -45,7 +45,7 @@ impl WasiClient {
             .map(|(filter, qos)| TopicFilter::new(filter, qos))
             .collect();
 
-        self.write(&Packet::Subscribe(subscribe))?;
+        self.write(&Packet::Subscribe(subscribe)).await?;
         debug!(packet_id, "Sent SUBSCRIBE");
 
         self.read_until(|p| match p {
@@ -82,7 +82,7 @@ impl WasiClient {
         };
         unsubscribe.filters = filters;
 
-        self.write(&Packet::Unsubscribe(unsubscribe))?;
+        self.write(&Packet::Unsubscribe(unsubscribe)).await?;
         debug!(packet_id, "Sent UNSUBSCRIBE");
 
         self.read_until(|p| match p {

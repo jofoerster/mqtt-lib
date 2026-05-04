@@ -13,8 +13,8 @@ use crate::transport::WasiStream;
 use super::WasiClientHandler;
 
 impl WasiClientHandler {
-    pub(super) fn handle_pingreq(&self, stream: &WasiStream) -> Result<()> {
-        self.write_packet(&Packet::PingResp, stream)
+    pub(super) async fn handle_pingreq(&self, stream: &WasiStream) -> Result<()> {
+        self.write_packet(&Packet::PingResp, stream).await
     }
 
     pub(super) fn handle_disconnect(&mut self, disconnect: &DisconnectPacket) -> Result<()> {
@@ -57,7 +57,7 @@ impl WasiClientHandler {
                 reason_code: ReasonCode::ProtocolError,
                 properties: mqtt5_protocol::protocol::v5::properties::Properties::default(),
             };
-            self.write_packet(&Packet::Disconnect(disconnect), stream)?;
+            self.write_packet(&Packet::Disconnect(disconnect), stream).await?;
             return Err(MqttError::ProtocolError(
                 "AUTH received outside of auth flow".to_string(),
             ));
@@ -78,7 +78,7 @@ impl WasiClientHandler {
                 reason_code: ReasonCode::ProtocolError,
                 properties: mqtt5_protocol::protocol::v5::properties::Properties::default(),
             };
-            self.write_packet(&Packet::Disconnect(disconnect), stream)?;
+            self.write_packet(&Packet::Disconnect(disconnect), stream).await?;
             return Err(MqttError::ProtocolError("AUTH method mismatch".to_string()));
         }
 
@@ -106,7 +106,7 @@ impl WasiClientHandler {
                 reason_code: ReasonCode::ProtocolError,
                 properties: mqtt5_protocol::protocol::v5::properties::Properties::default(),
             };
-            self.write_packet(&Packet::Disconnect(disconnect), stream)?;
+            self.write_packet(&Packet::Disconnect(disconnect), stream).await?;
             return Err(MqttError::ProtocolError(
                 "Re-auth before initial auth".to_string(),
             ));
@@ -117,7 +117,7 @@ impl WasiClientHandler {
                 reason_code: ReasonCode::ProtocolError,
                 properties: mqtt5_protocol::protocol::v5::properties::Properties::default(),
             };
-            self.write_packet(&Packet::Disconnect(disconnect), stream)?;
+            self.write_packet(&Packet::Disconnect(disconnect), stream).await?;
             return Err(MqttError::ProtocolError(
                 "Re-auth missing method".to_string(),
             ));
@@ -141,7 +141,7 @@ impl WasiClientHandler {
                 if let Some(data) = result.auth_data {
                     response.properties.set_authentication_data(data.into());
                 }
-                self.write_packet(&Packet::Auth(response), stream)?;
+                self.write_packet(&Packet::Auth(response), stream).await?;
                 Ok(())
             }
             EnhancedAuthStatus::Continue => {
@@ -152,7 +152,7 @@ impl WasiClientHandler {
                 if let Some(data) = result.auth_data {
                     response.properties.set_authentication_data(data.into());
                 }
-                self.write_packet(&Packet::Auth(response), stream)?;
+                self.write_packet(&Packet::Auth(response), stream).await?;
                 Ok(())
             }
             EnhancedAuthStatus::Failed => {
@@ -161,7 +161,7 @@ impl WasiClientHandler {
                     reason_code: result.reason_code,
                     properties: mqtt5_protocol::protocol::v5::properties::Properties::default(),
                 };
-                self.write_packet(&Packet::Disconnect(disconnect), stream)?;
+                self.write_packet(&Packet::Disconnect(disconnect), stream).await?;
                 Err(MqttError::AuthenticationFailed)
             }
         }
@@ -204,8 +204,8 @@ impl WasiClientHandler {
                         let user_id = self.user_id.clone();
                         let publish_clone = publish.clone();
                         let client_id_clone = client_id.to_string();
-                        crate::executor::spawn(async move {
-                            crate::timer::sleep(std::time::Duration::from_secs(u64::from(delay)))
+                        wstd::runtime::spawn(async move {
+                            wstd::task::sleep(wstd::time::Duration::from_secs(u64::from(delay)))
                                 .await;
 
                             let authorized = auth_provider
@@ -225,7 +225,8 @@ impl WasiClientHandler {
 
                             debug!("Publishing delayed will message for {client_id_clone}");
                             router.route_message(&publish_clone, None).await;
-                        });
+                        })
+                        .detach();
                     } else if self.authorize_will(client_id, &publish).await {
                         self.router.route_message(&publish, None).await;
                     }

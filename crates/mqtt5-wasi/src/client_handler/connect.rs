@@ -38,14 +38,14 @@ impl WasiClientHandler {
         if connect.protocol_version != 4 && connect.protocol_version != 5 {
             let mut connack = ConnAckPacket::new(false, ReasonCode::UnsupportedProtocolVersion);
             connack.protocol_version = connect.protocol_version;
-            self.write_packet(&Packet::ConnAck(connack), stream)?;
+            self.write_packet(&Packet::ConnAck(connack), stream).await?;
             return Err(MqttError::ProtocolError(
                 "Unsupported protocol version".to_string(),
             ));
         }
         self.protocol_version = connect.protocol_version;
 
-        self.check_load_balancer_redirect(&connect, stream)?;
+        self.check_load_balancer_redirect(&connect, stream).await?;
 
         let mut assigned_client_id = None;
         if connect.client_id.is_empty() {
@@ -59,7 +59,7 @@ impl WasiClientHandler {
 
         if !mqtt5_protocol::is_path_safe_client_id(&connect.client_id) {
             let connack = ConnAckPacket::new(false, ReasonCode::ClientIdentifierNotValid);
-            self.write_packet(&Packet::ConnAck(connack), stream)?;
+            self.write_packet(&Packet::ConnAck(connack), stream).await?;
             return Err(MqttError::InvalidClientId(connect.client_id));
         }
 
@@ -102,11 +102,11 @@ impl WasiClientHandler {
         if !auth_result.authenticated {
             let mut connack = ConnAckPacket::new(false, auth_result.reason_code);
             connack.protocol_version = self.protocol_version;
-            self.write_packet(&Packet::ConnAck(connack), stream)?;
+            self.write_packet(&Packet::ConnAck(connack), stream).await?;
             return Err(MqttError::AuthenticationFailed);
         }
 
-        self.validate_will_capabilities(&connect, stream)?;
+        self.validate_will_capabilities(&connect, stream).await?;
 
         self.client_id = Some(connect.client_id.clone());
         self.user_id = auth_result.user_id;
@@ -127,7 +127,7 @@ impl WasiClientHandler {
             self.set_server_capability_properties(&mut connack);
         }
 
-        self.write_packet(&Packet::ConnAck(connack), stream)?;
+        self.write_packet(&Packet::ConnAck(connack), stream).await?;
 
         info!(
             client_id = %connect.client_id,
@@ -209,7 +209,7 @@ impl WasiClientHandler {
                 "Session user mismatch, rejecting connection"
             );
             let connack = ConnAckPacket::new(false, ReasonCode::NotAuthorized);
-            self.write_packet(&Packet::ConnAck(connack), stream)?;
+            self.write_packet(&Packet::ConnAck(connack), stream).await?;
             return Err(MqttError::AuthenticationFailed);
         }
 
@@ -287,7 +287,7 @@ impl WasiClientHandler {
 
                     self.set_server_capability_properties(&mut connack);
 
-                    self.write_packet(&Packet::ConnAck(connack), stream)?;
+                    self.write_packet(&Packet::ConnAck(connack), stream).await?;
 
                     info!(
                         client_id = %pending.connect.client_id,
@@ -312,7 +312,7 @@ impl WasiClientHandler {
                 if let Some(data) = result.auth_data {
                     auth_packet.properties.set_authentication_data(data.into());
                 }
-                self.write_packet(&Packet::Auth(auth_packet), stream)?;
+                self.write_packet(&Packet::Auth(auth_packet), stream).await?;
                 Ok(())
             }
             EnhancedAuthStatus::Failed => {
@@ -321,67 +321,79 @@ impl WasiClientHandler {
 
                 let mut connack = ConnAckPacket::new(false, result.reason_code);
                 connack.protocol_version = self.protocol_version;
-                self.write_packet(&Packet::ConnAck(connack), stream)?;
+                self.write_packet(&Packet::ConnAck(connack), stream).await?;
                 Err(MqttError::AuthenticationFailed)
             }
         }
     }
 
-    fn check_load_balancer_redirect(
+    async fn check_load_balancer_redirect(
         &self,
         connect: &ConnectPacket,
         stream: &WasiStream,
     ) -> Result<()> {
-        if let Ok(config) = self.config.read() {
-            if let Some(ref lb) = config.load_balancer {
-                let generated;
-                let client_id = if connect.client_id.is_empty() {
-                    use std::sync::atomic::{AtomicU64, Ordering};
-                    static LB_COUNTER: AtomicU64 = AtomicU64::new(0);
-                    generated = format!("auto-{}", LB_COUNTER.fetch_add(1, Ordering::Relaxed));
-                    &generated
-                } else {
-                    &connect.client_id
-                };
-                if let Some(backend) = lb.select_backend(client_id) {
-                    let backend = backend.to_string();
+        let backend = {
+            let Ok(config) = self.config.read() else {
+                return Ok(());
+            };
+            let Some(ref lb) = config.load_balancer else {
+                return Ok(());
+            };
+            let generated;
+            let client_id = if connect.client_id.is_empty() {
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static LB_COUNTER: AtomicU64 = AtomicU64::new(0);
+                generated = format!("auto-{}", LB_COUNTER.fetch_add(1, Ordering::Relaxed));
+                &generated
+            } else {
+                &connect.client_id
+            };
+            match lb.select_backend(client_id) {
+                Some(backend) => {
                     info!(
                         client_id = %client_id,
                         backend = %backend,
                         "Redirecting client to backend"
                     );
-                    let connack = ConnAckPacket::new(false, ReasonCode::UseAnotherServer)
-                        .with_server_reference(backend);
-                    self.write_packet(&Packet::ConnAck(connack), stream)?;
-                    return Err(MqttError::UseAnotherServer);
+                    backend.to_string()
                 }
+                None => return Ok(()),
             }
-        }
-        Ok(())
+        };
+        let connack =
+            ConnAckPacket::new(false, ReasonCode::UseAnotherServer).with_server_reference(backend);
+        self.write_packet(&Packet::ConnAck(connack), stream).await?;
+        Err(MqttError::UseAnotherServer)
     }
 
-    fn validate_will_capabilities(
+    async fn validate_will_capabilities(
         &self,
         connect: &ConnectPacket,
         stream: &WasiStream,
     ) -> Result<()> {
-        if let Some(ref will) = connect.will {
-            if let Ok(config) = self.config.read() {
-                if (will.qos as u8) > config.maximum_qos {
-                    let mut connack = ConnAckPacket::new(false, ReasonCode::QoSNotSupported);
-                    connack.protocol_version = self.protocol_version;
-                    self.write_packet(&Packet::ConnAck(connack), stream)?;
-                    return Err(MqttError::ProtocolError(
-                        "Will QoS exceeds server maximum".to_string(),
-                    ));
-                }
-                if will.retain && !config.retain_available {
-                    let mut connack = ConnAckPacket::new(false, ReasonCode::RetainNotSupported);
-                    connack.protocol_version = self.protocol_version;
-                    self.write_packet(&Packet::ConnAck(connack), stream)?;
-                    return Err(MqttError::ProtocolError("Retain not supported".to_string()));
-                }
-            }
+        let Some(ref will) = connect.will else {
+            return Ok(());
+        };
+        let (max_qos, retain_available) = {
+            let Ok(config) = self.config.read() else {
+                return Ok(());
+            };
+            (config.maximum_qos, config.retain_available)
+        };
+
+        if (will.qos as u8) > max_qos {
+            let mut connack = ConnAckPacket::new(false, ReasonCode::QoSNotSupported);
+            connack.protocol_version = self.protocol_version;
+            self.write_packet(&Packet::ConnAck(connack), stream).await?;
+            return Err(MqttError::ProtocolError(
+                "Will QoS exceeds server maximum".to_string(),
+            ));
+        }
+        if will.retain && !retain_available {
+            let mut connack = ConnAckPacket::new(false, ReasonCode::RetainNotSupported);
+            connack.protocol_version = self.protocol_version;
+            self.write_packet(&Packet::ConnAck(connack), stream).await?;
+            return Err(MqttError::ProtocolError("Retain not supported".to_string()));
         }
         Ok(())
     }

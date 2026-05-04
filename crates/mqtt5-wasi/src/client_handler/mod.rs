@@ -23,6 +23,8 @@ use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::{Arc, RwLock};
 use tracing::{debug, error, info, warn};
+use wstd::runtime::spawn;
+use wstd::task::sleep;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum AuthState {
@@ -155,7 +157,7 @@ impl WasiClientHandler {
         // Watch for session takeover
         {
             let running_clone = Rc::clone(&running);
-            crate::executor::spawn(async move {
+            spawn(async move {
                 match disconnect_rx.await {
                     Ok(()) => {
                         info!("Session takeover signal received");
@@ -165,7 +167,8 @@ impl WasiClientHandler {
                         debug!("Disconnect sender dropped");
                     }
                 }
-            });
+            })
+            .detach();
         }
 
         // Spawn publish forwarder: reads from the router's publish channel
@@ -179,9 +182,9 @@ impl WasiClientHandler {
             let running_clone = Rc::clone(&running);
             let last_time = Rc::clone(&last_packet_time);
             let handler_id = self.handler_id;
-            crate::executor::spawn(async move {
+            spawn(async move {
                 loop {
-                    crate::timer::sleep(std::time::Duration::from_secs(1)).await;
+                    sleep(wstd::time::Duration::from_secs(1)).await;
                     if !*running_clone.borrow() {
                         break;
                     }
@@ -191,7 +194,8 @@ impl WasiClientHandler {
                         break;
                     }
                 }
-            });
+            })
+            .detach();
         }
 
         loop {
@@ -220,41 +224,39 @@ impl WasiClientHandler {
         let next_pid_fwd = Rc::clone(&self.next_packet_id);
         let handler_id = self.handler_id;
 
-        crate::executor::spawn(async move {
+        spawn(async move {
             loop {
                 if !*running_fwd.borrow() {
                     break;
                 }
 
-                match publish_rx.try_recv() {
-                    Ok(routable) => {
-                        let mut publish = routable.publish;
-                        if publish.qos != QoS::AtMostOnce {
-                            let pid = next_pid_fwd.get();
-                            next_pid_fwd.set(if pid == u16::MAX { 1 } else { pid + 1 });
-                            publish.packet_id = Some(pid);
+                let routable = match publish_rx.recv_async().await {
+                    Ok(r) => r,
+                    Err(flume::RecvError::Disconnected) => break,
+                };
 
-                            if publish.qos == QoS::ExactlyOnce {
-                                outbound_inflight_fwd
-                                    .borrow_mut()
-                                    .insert(pid, publish.clone());
-                            }
-                        }
+                let mut publish = routable.publish;
+                if publish.qos != QoS::AtMostOnce {
+                    let pid = next_pid_fwd.get();
+                    next_pid_fwd.set(if pid == u16::MAX { 1 } else { pid + 1 });
+                    publish.packet_id = Some(pid);
 
-                        if let Err(e) =
-                            WasiClientHandler::write_publish_packet(&publish, &stream_fwd)
-                        {
-                            error!(handler = handler_id, error = %e, "Publish forward error");
-                            break;
-                        }
+                    if publish.qos == QoS::ExactlyOnce {
+                        outbound_inflight_fwd
+                            .borrow_mut()
+                            .insert(pid, publish.clone());
                     }
-                    Err(flume::TryRecvError::Empty) => {
-                        crate::executor::yield_now().await;
-                    }
-                    Err(flume::TryRecvError::Disconnected) => break,
+                }
+
+                if let Err(e) =
+                    WasiClientHandler::write_publish_packet(&publish, &stream_fwd).await
+                {
+                    error!(handler = handler_id, error = %e, "Publish forward error");
+                    break;
                 }
             }
-        });
+        })
+        .detach();
     }
 
     async fn handle_packet(&mut self, packet: Packet, stream: &WasiStream) -> Result<()> {
@@ -272,7 +274,7 @@ impl WasiClientHandler {
                 self.handle_pubcomp(pubcomp).await;
                 Ok(())
             }
-            Packet::PingReq => self.handle_pingreq(stream),
+            Packet::PingReq => self.handle_pingreq(stream).await,
             Packet::Disconnect(ref disconnect) => self.handle_disconnect(disconnect),
             Packet::Auth(auth) => self.handle_auth(auth, stream).await,
             _ => {
@@ -283,7 +285,7 @@ impl WasiClientHandler {
     }
 
     #[allow(clippy::unused_self)]
-    pub(super) fn write_packet(&self, packet: &Packet, stream: &WasiStream) -> Result<()> {
+    pub(super) async fn write_packet(&self, packet: &Packet, stream: &WasiStream) -> Result<()> {
         let mut buf = BytesMut::new();
 
         match packet {
@@ -307,7 +309,7 @@ impl WasiClientHandler {
             }
         }
 
-        stream.write(&buf)?;
+        stream.write(&buf).await?;
         Ok(())
     }
 
