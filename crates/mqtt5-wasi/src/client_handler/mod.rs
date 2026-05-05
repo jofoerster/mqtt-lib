@@ -18,7 +18,7 @@ use mqtt5_protocol::packet::Packet;
 use mqtt5_protocol::KeepaliveConfig;
 use mqtt5_protocol::QoS;
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::{Arc, RwLock};
@@ -53,6 +53,7 @@ pub struct WasiClientHandler {
     publish_rx: flume::Receiver<mqtt5::broker::router::RoutableMessage>,
     publish_tx: flume::Sender<mqtt5::broker::router::RoutableMessage>,
     pub(super) inflight_publishes: HashMap<u16, PublishPacket>,
+    pub(super) inflight_handled: HashSet<u16>,
     pub(super) outbound_inflight: Rc<RefCell<HashMap<u16, PublishPacket>>>,
     pub(super) next_packet_id: Rc<Cell<u16>>,
     pub(super) normal_disconnect: bool,
@@ -94,6 +95,7 @@ impl WasiClientHandler {
             publish_rx,
             publish_tx,
             inflight_publishes: HashMap::new(),
+            inflight_handled: HashSet::new(),
             outbound_inflight: Rc::new(RefCell::new(HashMap::new())),
             next_packet_id: Rc::new(Cell::new(1)),
             normal_disconnect: false,

@@ -1,4 +1,5 @@
 use bytes::BytesMut;
+use mqtt5::broker::events::{ClientPublishEvent, PublishAction};
 use mqtt5::broker::storage::{InflightDirection, InflightMessage, InflightPhase, StorageBackend};
 use mqtt5_protocol::error::Result;
 use mqtt5_protocol::packet::puback::PubAckPacket;
@@ -9,7 +10,8 @@ use mqtt5_protocol::packet::pubrel::PubRelPacket;
 use mqtt5_protocol::packet::MqttPacket;
 use mqtt5_protocol::packet::Packet;
 use mqtt5_protocol::protocol::v5::reason_codes::ReasonCode;
-use mqtt5_protocol::QoS;
+use mqtt5_protocol::{PropertyId, PropertyValue, QoS};
+use std::sync::Arc;
 use tracing::{debug, warn};
 
 use crate::transport::WasiStream;
@@ -71,6 +73,24 @@ impl WasiClientHandler {
             .properties
             .inject_client_id(Some(client_id.as_str()));
 
+        let client_id = client_id.clone();
+        match self.fire_publish_event(&publish, &client_id).await {
+            PublishAction::Continue => {
+                self.route_publish_by_qos(publish, &client_id, stream).await
+            }
+            PublishAction::Transform(modified) => {
+                self.route_publish_by_qos(modified, &client_id, stream).await
+            }
+            PublishAction::Handled => self.complete_qos_handshake(publish, stream).await,
+        }
+    }
+
+    async fn route_publish_by_qos(
+        &mut self,
+        publish: PublishPacket,
+        client_id: &str,
+        stream: &WasiStream,
+    ) -> Result<()> {
         match publish.qos {
             QoS::AtMostOnce => {
                 self.router.route_message(&publish, Some(client_id)).await;
@@ -84,7 +104,7 @@ impl WasiClientHandler {
                 let packet_id = publish.packet_id.unwrap();
                 let inflight = InflightMessage::from_publish(
                     &publish,
-                    client_id.clone(),
+                    client_id.to_string(),
                     InflightDirection::Inbound,
                     InflightPhase::AwaitingPubrel,
                 );
@@ -96,8 +116,85 @@ impl WasiClientHandler {
                 self.write_packet(&Packet::PubRec(pubrec), stream).await?;
             }
         }
-
         Ok(())
+    }
+
+    /// Acknowledge the QoS handshake for a publish whose `PublishAction` was
+    /// `Handled`. The application has already consumed it, so it must not be
+    /// routed to subscribers.
+    async fn complete_qos_handshake(
+        &mut self,
+        publish: PublishPacket,
+        stream: &WasiStream,
+    ) -> Result<()> {
+        match publish.qos {
+            QoS::AtMostOnce => {}
+            QoS::AtLeastOnce => {
+                let puback = PubAckPacket::new(publish.packet_id.unwrap());
+                self.write_packet(&Packet::PubAck(puback), stream).await?;
+            }
+            QoS::ExactlyOnce => {
+                let packet_id = publish.packet_id.unwrap();
+                self.inflight_handled.insert(packet_id);
+                let pubrec = PubRecPacket::new(packet_id);
+                self.write_packet(&Packet::PubRec(pubrec), stream).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn fire_publish_event(
+        &self,
+        publish: &PublishPacket,
+        client_id: &str,
+    ) -> PublishAction {
+        let handler = {
+            let cfg = match self.config.read() {
+                Ok(c) => c,
+                Err(_) => {
+                    warn!("BrokerConfig RwLock poisoned; skipping event handler");
+                    return PublishAction::Continue;
+                }
+            };
+            match cfg.event_handler.as_ref() {
+                Some(h) => Arc::clone(h),
+                None => return PublishAction::Continue,
+            }
+        };
+
+        let response_topic = publish
+            .properties
+            .get(PropertyId::ResponseTopic)
+            .and_then(|v| {
+                if let PropertyValue::Utf8String(s) = v {
+                    Some(Arc::from(s.as_str()))
+                } else {
+                    None
+                }
+            });
+        let correlation_data = publish
+            .properties
+            .get(PropertyId::CorrelationData)
+            .and_then(|v| {
+                if let PropertyValue::BinaryData(b) = v {
+                    Some(b.clone())
+                } else {
+                    None
+                }
+            });
+
+        let event = ClientPublishEvent {
+            client_id: client_id.to_string().into(),
+            user_id: self.user_id.as_deref().map(Arc::from),
+            topic: publish.topic_name.clone().into(),
+            payload: publish.payload.clone(),
+            qos: publish.qos,
+            retain: publish.retain,
+            packet_id: publish.packet_id,
+            response_topic,
+            correlation_data,
+        };
+        handler.on_client_publish(event).await
     }
 
     async fn reject_publish(
@@ -174,6 +271,10 @@ impl WasiClientHandler {
                 .remove_inflight_message(client_id, pubrel.packet_id, InflightDirection::Inbound)
                 .await;
             self.router.route_message(&publish, Some(client_id)).await;
+            ReasonCode::Success
+        } else if self.inflight_handled.remove(&pubrel.packet_id) {
+            // The publish was consumed via PublishAction::Handled — finish the
+            // QoS-2 exchange without re-routing to subscribers.
             ReasonCode::Success
         } else {
             ReasonCode::PacketIdentifierNotFound
