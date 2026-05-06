@@ -3,6 +3,7 @@ members = [
     "crates/mqtt5-protocol",
     "crates/mqtt5",
     "crates/mqtt5-wasm",
+    "crates/mqtt5-wasi",
     "crates/mqttv5-cli",
     "crates/mqtt5-conformance",
     "crates/mqtt5-conformance-macros",
