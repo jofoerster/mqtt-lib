@@ -29,19 +29,22 @@ pub async fn read_packet(stream: &WasiStream, protocol_version: u8) -> Result<Pa
 
     let mut body_buf = vec![0u8; remaining_length];
 
-    if remaining_length > 0 {
-        let bytes_read = if cursor.remaining() > 0 {
-            let available = cursor.remaining().min(remaining_length);
-            body_buf[..available].copy_from_slice(&cursor[..available]);
-            cursor.advance(available);
-            available
-        } else {
-            0
-        };
+    let from_cursor = cursor.remaining().min(remaining_length);
+    if from_cursor > 0 {
+        body_buf[..from_cursor].copy_from_slice(&cursor[..from_cursor]);
+        cursor.advance(from_cursor);
+    }
 
-        if bytes_read < remaining_length {
-            stream.read_exact(&mut body_buf[bytes_read..]).await?;
-        }
+    // Anything still in cursor belongs to the next packet — return it to the
+    // stream so the next call sees it. Without this, packets with
+    // `remaining_length == 0` (PINGREQ, PINGRESP, DISCONNECT, AUTH) silently
+    // drop the trailing bytes and the decoder desyncs.
+    if cursor.has_remaining() {
+        stream.pushback(cursor);
+    }
+
+    if from_cursor < remaining_length {
+        stream.read_exact(&mut body_buf[from_cursor..]).await?;
     }
 
     let mut body = &body_buf[..];
